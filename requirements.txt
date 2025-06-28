@@ -20,6 +20,9 @@ sentencepiece
 librosa
 gradio
 tqdm
+ebooklib
+beautifulsoup4
+psutil
 
 WeTextProcessing; platform_machine != "Darwin"
 wetext; platform_system == "Darwin"

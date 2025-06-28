@@ -1,0 +1,19 @@
+conda create -n index-tts python=3.10
+conda activate index-tts
+conda install -c conda-forge ffmpeg
+
+#If you are using Windows you may encounter an error when installing pynini: ERROR: Failed building wheel for pynini In this case, please install pynini via conda:
+
+# after conda activate index-tts
+conda install -c conda-forge pynini==2.1.6
+pip install WeTextProcessing --no-deps
+pip install ebooklib beautifulsoup4
+# Download by huggingface-cli:
+huggingface-cli download IndexTeam/IndexTTS-1.5 config.yaml bigvgan_discriminator.pth bigvgan_generator.pth bpe.model dvae.pth gpt.pth unigram_12000.vocab   --local-dir checkpoints
+  
+pip install -e ".[webui]" --no-build-isolation
+pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+python webui.py
+
+# use another model version:
+python webui.py --model_dir IndexTTS-1.5
