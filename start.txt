@@ -12,8 +12,6 @@ pip install ebooklib beautifulsoup4
 huggingface-cli download IndexTeam/IndexTTS-1.5 config.yaml bigvgan_discriminator.pth bigvgan_generator.pth bpe.model dvae.pth gpt.pth unigram_12000.vocab   --local-dir checkpoints
   
 pip install -e ".[webui]" --no-build-isolation
+#install pytorch again here if you encounter issues that cannot find CUDA: 
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 python webui.py
-
-# use another model version:
-python webui.py --model_dir IndexTTS-1.5
