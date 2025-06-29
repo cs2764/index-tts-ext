@@ -83,6 +83,51 @@ def read_txt_file(file_path):
         except:
             return ""
 
+def format_chapters_display(chapters):
+    """Format chapters information for display"""
+    if not chapters or len(chapters) == 0:
+        return gr.update(visible=False, value="")
+    
+    # Create formatted chapter list with better spacing and structure
+    chapter_info = []
+    chapter_info.append("📚 **EPUB章节列表**")
+    chapter_info.append("---")  # 分隔线
+    chapter_info.append(f"📖 共检测到 **{len(chapters)}** 个章节")
+    chapter_info.append("")  # 空行分隔
+    
+    # 限制显示的章节数量，避免界面过长
+    max_display_chapters = 8
+    chapters_to_show = chapters[:max_display_chapters]
+    
+    for i, chapter in enumerate(chapters_to_show, 1):
+        title = chapter.get('title', f'章节 {i}')
+        # 优化内容预览长度：减少到35个字符，更简洁
+        content_preview = chapter.get('content', '')[:35].replace('\n', ' ').strip()
+        if len(chapter.get('content', '')) > 35:
+            content_preview += "..."
+        
+        # 使用更清晰的格式，增加视觉层次
+        chapter_info.append(f"### 📄 {i}. {title}")
+        chapter_info.append(f"> 💭 {content_preview}")
+        chapter_info.append("")  # 每个章节后添加空行分隔
+    
+    # 如果章节数量超过显示限制，添加提示
+    if len(chapters) > max_display_chapters:
+        remaining = len(chapters) - max_display_chapters
+        chapter_info.append("---")
+        chapter_info.append(f"⏬ **还有 {remaining} 个章节未显示**")
+        chapter_info.append("")
+    
+    # 使用提示部分，格式更清晰
+    chapter_info.append("---")
+    chapter_info.append("💡 **使用提示**")
+    chapter_info.append("")
+    chapter_info.append("🔸 启用「章节分段」功能可将音频按章节分割")
+    chapter_info.append("🔸 生成M4B格式时会自动添加章节书签")
+    chapter_info.append("🔸 分段文件将保存在统一的文件夹中")
+    
+    return gr.update(visible=True, value="\n".join(chapter_info))
+
 def read_epub_file(file_path):
     """Read text from epub file"""
     try:
@@ -318,8 +363,8 @@ def get_task_status(task_id):
 
 def background_audio_generation(task_id, prompt_path, text_to_process, infer_mode, 
                                max_text_tokens_per_sentence, sentences_bucket_max_size,
-                               audio_format, output_path, temp_wav_path, chapters, kwargs):
-    """后台音频生成函数"""
+                               audio_format, audio_bitrate, output_path, temp_wav_path, chapters, kwargs):
+    """后台音频生成"""
     try:
         print(f"=== 后台任务 {task_id} 开始 ===")
         update_task_status(task_id, status="🚀 初始化", progress="正在准备生成参数...")
@@ -335,13 +380,15 @@ def background_audio_generation(task_id, prompt_path, text_to_process, infer_mod
             def format_time(self, seconds):
                 """格式化时间为人类可读格式"""
                 if seconds < 60:
-                    return f"{seconds:.1f}秒"
+                    return f"{int(seconds)}秒"
                 elif seconds < 3600:
-                    minutes = seconds / 60
-                    return f"{minutes:.1f}分钟"
+                    minutes = int(seconds // 60)
+                    secs = int(seconds % 60)
+                    return f"{minutes}分{secs}秒"
                 else:
-                    hours = seconds / 3600
-                    return f"{hours:.1f}小时"
+                    hours = int(seconds // 3600)
+                    minutes = int((seconds % 3600) // 60)
+                    return f"{hours}小时{minutes}分钟"
             
             def __call__(self, progress=None, desc=None):
                 current_time = time.time()
@@ -349,26 +396,13 @@ def background_audio_generation(task_id, prompt_path, text_to_process, infer_mod
                 if current_time - self.last_update > 1.0:  # 每秒最多更新一次
                     progress_text = ""
                     if desc:
+                        # 直接使用从console传来的完整描述信息，实现同步显示
                         progress_text = f"🎵 {desc}"
-                        
-                        # 添加时间信息
-                        elapsed = current_time - self.start_time
-                        elapsed_formatted = self.format_time(elapsed)
-                        progress_text += f"\n⏱️ 已用时: {elapsed_formatted}"
-                        
                     elif progress is not None:
+                        # 回退方案：自己构建进度信息
                         elapsed = current_time - self.start_time
                         elapsed_formatted = self.format_time(elapsed)
                         progress_text = f"🎵 进度: {progress:.1f}%\n⏱️ 已用时: {elapsed_formatted}"
-                    
-                    # 每5秒添加一次系统信息
-                    if current_time - self.last_system_update > 5.0:
-                        try:
-                            system_info = get_system_status()
-                            progress_text += f"\n\n📊 系统状态:\n{system_info}"
-                            self.last_system_update = current_time
-                        except:
-                            pass  # 忽略系统信息获取错误
                     
                     update_task_status(self.task_id, progress=progress_text)
                     self.last_update = current_time
@@ -404,13 +438,13 @@ def background_audio_generation(task_id, prompt_path, text_to_process, infer_mod
             print(f"[Task {task_id}] 转换音频格式到 {audio_format}...")
             
             if audio_format == "MP3":
-                if convert_audio_format(wav_output, output_path, "mp3", "64k"):
+                if convert_audio_format(wav_output, output_path, "mp3", f"{audio_bitrate}k"):
                     final_output = output_path
                     # Remove temp wav file
                     if os.path.exists(temp_wav_path) and temp_wav_path != output_path:
                         os.remove(temp_wav_path)
             elif audio_format == "M4B":
-                conversion_success = convert_audio_format(wav_output, output_path, "m4b", "64k", chapters)
+                conversion_success = convert_audio_format(wav_output, output_path, "m4b", f"{audio_bitrate}k", chapters)
                 if conversion_success:
                     final_output = output_path
                     print(f"[Task {task_id}] ✅ M4B转换成功: {output_path}")
@@ -448,7 +482,7 @@ def background_audio_generation(task_id, prompt_path, text_to_process, infer_mod
 
 def submit_background_task(prompt_path, text_to_process, infer_mode, 
                           max_text_tokens_per_sentence, sentences_bucket_max_size,
-                          audio_format, output_path, temp_wav_path, chapters, kwargs):
+                          audio_format, audio_bitrate, output_path, temp_wav_path, chapters, kwargs):
     """提交后台任务"""
     task_id = str(uuid.uuid4())[:8]  # 生成短任务ID
     
@@ -460,7 +494,7 @@ def submit_background_task(prompt_path, text_to_process, infer_mode,
         background_audio_generation,
         task_id, prompt_path, text_to_process, infer_mode,
         max_text_tokens_per_sentence, sentences_bucket_max_size,
-        audio_format, output_path, temp_wav_path, chapters, kwargs
+        audio_format, audio_bitrate, output_path, temp_wav_path, chapters, kwargs
     )
     
     print(f"已提交后台任务: {task_id}")
@@ -484,18 +518,12 @@ def clear_completed_tasks():
         
         return len(completed_tasks)
 
-with open("tests/cases.jsonl", "r", encoding="utf-8") as f:
-    example_cases = []
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        example = json.loads(line)
-        example_cases.append([os.path.join("tests", example.get("prompt_audio", "sample_prompt.wav")),
-                              example.get("text"), ["普通推理", "批次推理"][example.get("infer_mode", 0)]])
+# 已删除示例案例加载代码
+example_cases = []
 
 def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sentences_bucket_max_size=6,
-                auto_save=True, audio_format="MP3", uploaded_file_name="", selected_sample="", full_text="", chapters=None, 
+                auto_save=True, audio_format="MP3", audio_bitrate=64, enable_chapter_split=False, chapters_per_file=1,
+                uploaded_file_name="", selected_sample="", full_text="", chapters=None, 
                 background_mode=True, *args, progress=gr.Progress()):
     
     def update_status(status, detailed_progress="", system_status="", error_msg="", show_progress=False, show_system=False, show_error=False):
@@ -579,6 +607,59 @@ def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sente
         
         print(f"待处理文本长度: {len(text_to_process)}")
         
+        # 处理章节分段
+        processed_chapters = []
+        output_folder = None  # 用于分段文件的文件夹
+        
+        if chapters and len(chapters) > 0 and enable_chapter_split:
+            print(f"启用章节分段，将按每{chapters_per_file}章分割")
+            
+            # 按章节数量分组
+            for i in range(0, len(chapters), chapters_per_file):
+                chapter_group = chapters[i:i+chapters_per_file]
+                
+                # 合并该组章节的文本
+                group_text = ""
+                group_titles = []
+                for chapter in chapter_group:
+                    group_text += chapter.get("content", "") + "\n\n"
+                    group_titles.append(chapter.get("title", f"章节{i+1}"))
+                
+                processed_chapters.append({
+                    "titles": group_titles,
+                    "content": group_text.strip(),
+                    "start_chapter": i + 1,
+                    "end_chapter": min(i + chapters_per_file, len(chapters)),
+                    "file_index": (i // chapters_per_file) + 1  # 添加文件序号
+                })
+            
+            print(f"章节分组完成，共{len(processed_chapters)}个文件组")
+            
+            # 创建分段文件夹
+            date = datetime.datetime.now().strftime("%Y%m%d")
+            speaker_name = get_speaker_name_from_path(prompt_path)
+            
+            if uploaded_file_name:
+                base_name = os.path.splitext(uploaded_file_name)[0]
+                folder_name = f"{base_name}_{date}_{speaker_name}"
+            else:
+                folder_name = f"{date}_{speaker_name}"
+            
+            output_folder = os.path.join("outputs", folder_name)
+            os.makedirs(output_folder, exist_ok=True)
+            print(f"创建分段文件夹: {output_folder}")
+        else:
+            # 不分割或没有章节信息，作为单个文件处理
+            processed_chapters.append({
+                "titles": ["完整内容"],
+                "content": text_to_process,
+                "start_chapter": 1,
+                "end_chapter": 1,
+                "file_index": 1
+            })
+        
+        print(f"将生成{len(processed_chapters)}个音频文件")
+        
         # 检查是否需要后台处理
         text_length = len(text_to_process)
         estimated_time = text_length / 100  # 粗略估算：每100字符约1秒
@@ -638,7 +719,7 @@ def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sente
             task_id = submit_background_task(
                 prompt_path, text_to_process, infer_mode,
                 max_text_tokens_per_sentence, sentences_bucket_max_size,
-                audio_format, output_path, temp_wav_path, chapters, kwargs
+                audio_format, audio_bitrate, output_path, temp_wav_path, chapters, kwargs
             )
             
             # 返回任务信息
@@ -662,36 +743,117 @@ def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sente
         prep_system_info = get_system_status()
         status_updates = update_status("📋 准备生成参数...", detailed_info, prep_system_info, show_progress=True, show_system=True)
         
-        # Generate date and speaker name
-        date = datetime.datetime.now().strftime("%Y%m%d")
-        speaker_name = get_speaker_name_from_path(prompt_path)
+        # 设置输出路径 - 根据是否分段处理
+        if enable_chapter_split and len(processed_chapters) > 1:
+            # 分段模式：处理多个文件
+            print(f"分段模式：将生成{len(processed_chapters)}个文件到文件夹：{output_folder}")
+            
+            # 生成所有分段文件
+            generated_files = []
+            total_chapters = len(processed_chapters)
+            
+            for idx, chapter_group in enumerate(processed_chapters):
+                # 更新进度状态
+                chapter_progress = f"🎵 正在生成分段 {idx+1}/{total_chapters}..."
+                chapter_info = f"📚 章节: {chapter_group['start_chapter']}-{chapter_group['end_chapter']}\n📄 内容长度: {len(chapter_group['content'])} 字符"
+                chapter_system_info = get_system_status()
+                status_updates = update_status(chapter_progress, chapter_info, chapter_system_info, show_progress=True, show_system=True)
+                
+                # 生成文件名：epub文件名+序号
+                if uploaded_file_name:
+                    base_name = os.path.splitext(uploaded_file_name)[0]
+                    segment_filename = f"{base_name}_{chapter_group['file_index']}"
+                else:
+                    segment_filename = f"segment_{chapter_group['file_index']}"
+                
+                # 设置文件路径
+                if audio_format == "MP3":
+                    segment_path = os.path.join(output_folder, f"{segment_filename}.mp3")
+                    temp_segment_path = os.path.join(output_folder, f"temp_{segment_filename}.wav")
+                elif audio_format == "M4B":
+                    segment_path = os.path.join(output_folder, f"{segment_filename}.m4b")
+                    temp_segment_path = os.path.join(output_folder, f"temp_{segment_filename}.wav")
+                else:  # WAV
+                    segment_path = os.path.join(output_folder, f"{segment_filename}.wav")
+                    temp_segment_path = segment_path
+                
+                print(f"生成分段文件 {idx+1}: {segment_path}")
+                
+                # 生成音频
+                start_time = time.time()
+                if infer_mode == "普通推理":
+                    wav_output = tts.infer(prompt_path, chapter_group['content'], temp_segment_path, verbose=cmd_args.verbose,
+                                       max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
+                                       **kwargs)
+                else:
+                    # 批次推理
+                    wav_output = tts.infer_fast(prompt_path, chapter_group['content'], temp_segment_path, verbose=cmd_args.verbose,
+                        max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
+                        sentences_bucket_max_size=(sentences_bucket_max_size),
+                        **kwargs)
+                
+                generation_time = time.time() - start_time
+                print(f"分段 {idx+1} 生成完成，耗时: {generation_time:.2f} 秒")
+                
+                # 转换格式（如果需要）
+                final_segment_path = wav_output
+                if auto_save and audio_format != "WAV":
+                    print(f"转换分段 {idx+1} 格式到 {audio_format}...")
+                    if audio_format == "MP3":
+                        if convert_audio_format(wav_output, segment_path, "mp3", f"{audio_bitrate}k"):
+                            final_segment_path = segment_path
+                            if os.path.exists(temp_segment_path) and temp_segment_path != segment_path:
+                                os.remove(temp_segment_path)
+                    elif audio_format == "M4B":
+                        if convert_audio_format(wav_output, segment_path, "m4b", f"{audio_bitrate}k", [chapters[i] for i in range(chapter_group['start_chapter']-1, chapter_group['end_chapter'])]):
+                            final_segment_path = segment_path
+                            if os.path.exists(temp_segment_path) and temp_segment_path != segment_path:
+                                os.remove(temp_segment_path)
+                
+                generated_files.append(final_segment_path)
+                print(f"分段 {idx+1} 完成: {final_segment_path}")
+            
+            # 分段生成完成
+            print(f"所有分段生成完成，共{len(generated_files)}个文件")
+            success_info = f"✅ 分段生成完成！\n📁 文件夹: {os.path.basename(output_folder)}\n📄 文件数: {len(generated_files)}\n📏 总大小: {sum(os.path.getsize(f) for f in generated_files) / 1024 / 1024:.2f} MB"
+            final_system_info = get_system_status()
+            status_updates = update_status("✅ 分段生成完成", success_info, final_system_info, show_progress=True, show_system=True)
+            
+            # 返回第一个文件作为预览（或者可以返回文件夹信息）
+            return gr.update(value=generated_files[0], visible=True), *status_updates
         
-        # Create output filename based on source
-        if uploaded_file_name:
-            # If text comes from uploaded file: 文件名_日期_音色
-            base_name = os.path.splitext(uploaded_file_name)[0]
-            filename = f"{base_name}_{date}_{speaker_name}"
         else:
-            # Regular text input: 日期_音色
-            filename = f"{date}_{speaker_name}"
-        
-        print(f"输出文件名: {filename}")
-        
-        # Set output path with proper extension
-        if audio_format == "MP3":
-            output_path = os.path.join("outputs", f"{filename}.mp3")
-            temp_wav_path = os.path.join("outputs", f"temp_{date}_{int(time.time())}.wav")  # Temp file without dot prefix
-        elif audio_format == "M4B":
-            output_path = os.path.join("outputs", f"{filename}.m4b")
-            temp_wav_path = os.path.join("outputs", f"temp_{date}_{int(time.time())}.wav")  # Temp file without dot prefix
-        else:  # WAV
-            output_path = os.path.join("outputs", f"{filename}.wav")
-            temp_wav_path = output_path
-        
-        print(f"输出路径: {output_path}")
-        
-        # Ensure outputs directory exists
-        os.makedirs("outputs", exist_ok=True)
+            # 单文件模式：正常处理流程
+            # Generate date and speaker name
+            date = datetime.datetime.now().strftime("%Y%m%d")
+            speaker_name = get_speaker_name_from_path(prompt_path)
+            
+            # Create output filename based on source
+            if uploaded_file_name:
+                # If text comes from uploaded file: 文件名_日期_音色
+                base_name = os.path.splitext(uploaded_file_name)[0]
+                filename = f"{base_name}_{date}_{speaker_name}"
+            else:
+                # Regular text input: 日期_音色
+                filename = f"{date}_{speaker_name}"
+            
+            print(f"输出文件名: {filename}")
+            
+            # Set output path with proper extension
+            if audio_format == "MP3":
+                output_path = os.path.join("outputs", f"{filename}.mp3")
+                temp_wav_path = os.path.join("outputs", f"temp_{date}_{int(time.time())}.wav")
+            elif audio_format == "M4B":
+                output_path = os.path.join("outputs", f"{filename}.m4b")
+                temp_wav_path = os.path.join("outputs", f"temp_{date}_{int(time.time())}.wav")
+            else:  # WAV
+                output_path = os.path.join("outputs", f"{filename}.wav")
+                temp_wav_path = output_path
+            
+            print(f"输出路径: {output_path}")
+            
+            # Ensure outputs directory exists
+            os.makedirs("outputs", exist_ok=True)
         
         # 创建增强的进度回调
         class EnhancedProgress:
@@ -704,26 +866,33 @@ def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sente
             def format_time(self, seconds):
                 """格式化时间为人类可读格式"""
                 if seconds < 60:
-                    return f"{seconds:.1f}秒"
+                    return f"{int(seconds)}秒"
                 elif seconds < 3600:
-                    minutes = seconds / 60
-                    return f"{minutes:.1f}分钟"
+                    minutes = int(seconds // 60)
+                    secs = int(seconds % 60)
+                    return f"{minutes}分{secs}秒"
                 else:
-                    hours = seconds / 3600
-                    return f"{hours:.1f}小时"
+                    hours = int(seconds // 3600)
+                    minutes = int((seconds % 3600) // 60)
+                    return f"{hours}小时{minutes}分钟"
             
             def __call__(self, value, desc=None):
                 current_time = time.time()
-                # 每2秒更新一次系统信息，避免过于频繁
+                # 每2秒更新一次界面，避免过于频繁
                 if current_time - self.last_system_update > 2.0:
                     try:
-                        system_info = get_system_status()
-                        # 添加时间信息到描述中
-                        elapsed = current_time - self.start_time
-                        elapsed_formatted = self.format_time(elapsed)
+                        # 如果有完整的描述信息（从console传来），直接使用
+                        if desc:
+                            # 直接使用从console传来的完整描述信息，实现同步显示
+                            enhanced_desc = desc
+                        else:
+                            # 回退方案：自己构建进度信息
+                            elapsed = current_time - self.start_time
+                            elapsed_formatted = self.format_time(elapsed)
+                            enhanced_desc = f"正在生成音频...\n⏱️ 已用时: {elapsed_formatted}"
                         
-                        enhanced_desc = desc or "正在生成音频..."
-                        enhanced_desc += f"\n⏱️ 已用时: {elapsed_formatted}"
+                        # 获取系统信息用于系统状态显示
+                        system_info = get_system_status()
                         
                         self.update_func("🎵 正在生成音频...", enhanced_desc, system_info, show_progress=True, show_system=True)
                         self.last_system_update = current_time
@@ -790,7 +959,7 @@ def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sente
             status_updates = update_status("🔄 转换音频格式...", conversion_info, conv_system_info, show_progress=True, show_system=True)
             
             if audio_format == "MP3":
-                if convert_audio_format(wav_output, output_path, "mp3", "64k"):
+                if convert_audio_format(wav_output, output_path, "mp3", f"{audio_bitrate}k"):
                     final_output = output_path
                     # Remove temp wav file
                     if os.path.exists(temp_wav_path) and temp_wav_path != output_path:
@@ -802,7 +971,7 @@ def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sente
                 print(f"   输出文件: {output_path}")
                 print(f"   章节信息: {chapters}")
                 
-                conversion_success = convert_audio_format(wav_output, output_path, "m4b", "64k", chapters)
+                conversion_success = convert_audio_format(wav_output, output_path, "m4b", f"{audio_bitrate}k", chapters)
                 if conversion_success:
                     final_output = output_path
                     print(f"✅ M4B转换成功: {output_path}")
@@ -854,39 +1023,40 @@ def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sente
         return gr.update(value=None, visible=True), *status_updates
 
 def get_system_status():
-    """获取系统状态信息"""
+    """获取系统状态信息（移除GPU信息）"""
     try:
+        # 优先使用 IndexTTS 实例的系统信息获取方法，确保一致性
+        if hasattr(tts, 'get_system_info'):
+            system_info = tts.get_system_info(force_refresh=True)
+            
+            # 系统内存信息
+            if "memory_percent" in system_info:
+                memory_used = system_info["memory_used"]
+                memory_total = system_info["memory_total"]
+                memory_percent = system_info["memory_percent"]
+                cpu_percent = system_info["cpu_percent"]
+                process_memory = system_info["process_memory"]
+                
+                system_memory_info = f"""💾 系统内存:
+使用: {memory_used:.2f}GB
+总计: {memory_total:.2f}GB
+使用率: {memory_percent:.1f}%
+
+🖥️ CPU使用率: {cpu_percent:.1f}%
+
+📊 进程内存: {process_memory:.2f}GB"""
+            else:
+                system_memory_info = "💾 系统信息获取失败"
+            
+            return system_memory_info
+        
+        # 回退方案：直接获取
         import psutil
         import os
         
-        # GPU信息
-        gpu_info = ""
-        if hasattr(tts, 'device') and 'cuda' in str(tts.device):
-            try:
-                import torch
-                # 强制同步确保获取最新显存信息
-                torch.cuda.synchronize(tts.device)
-                
-                gpu_allocated = torch.cuda.memory_allocated(tts.device) / 1024**3
-                gpu_reserved = torch.cuda.memory_reserved(tts.device) / 1024**3
-                gpu_total = torch.cuda.get_device_properties(tts.device).total_memory / 1024**3
-                gpu_usage = (gpu_allocated / gpu_total) * 100
-                gpu_name = torch.cuda.get_device_name(tts.device)
-                
-                gpu_info = f"""🎮 GPU信息:
-{gpu_name}
-已分配: {gpu_allocated:.2f}GB
-已缓存: {gpu_reserved:.2f}GB
-总容量: {gpu_total:.2f}GB
-使用率: {gpu_usage:.1f}%"""
-            except Exception as e:
-                gpu_info = f"🎮 GPU信息获取失败: {str(e)}"
-        else:
-            gpu_info = "🎮 当前使用CPU模式"
-        
         # 系统内存信息
         memory = psutil.virtual_memory()
-        cpu_percent = psutil.cpu_percent(interval=0.05)  # 更短的interval
+        cpu_percent = psutil.cpu_percent(interval=0.01)  # 更短的interval
         process_memory = psutil.Process(os.getpid()).memory_info().rss / 1024**3
         
         system_info = f"""💾 系统内存:
@@ -898,7 +1068,7 @@ def get_system_status():
 
 📊 进程内存: {process_memory:.2f}GB"""
         
-        return f"{gpu_info}\n\n{system_info}"
+        return system_info
         
     except Exception as e:
         return f"❌ 系统信息获取失败: {str(e)}"
@@ -951,7 +1121,7 @@ def update_prompt_audio():
 def process_uploaded_file(file):
     """Process uploaded text/epub file"""
     if file is None:
-        return "", "", "", ""
+        return "", "", "", "", gr.update(visible=False, value="")
     
     file_path = file.name
     filename = os.path.basename(file_path)
@@ -961,10 +1131,12 @@ def process_uploaded_file(file):
     
     if file_ext == '.txt':
         content = read_txt_file(file_path)
+        chapters_display_update = gr.update(visible=False, value="")
     elif file_ext == '.epub':
         content, chapters = read_epub_file(file_path)
+        chapters_display_update = format_chapters_display(chapters)
     else:
-        return "不支持的文件格式，仅支持 .txt 和 .epub 文件", "", "", ""
+        return "不支持的文件格式，仅支持 .txt 和 .epub 文件", "", "", "", gr.update(visible=False, value="")
     
     # Limit preview length to prevent browser crashes with large files
     max_preview_chars = 10000  # 约10,000字符预览
@@ -972,12 +1144,12 @@ def process_uploaded_file(file):
         preview_content = content[:max_preview_chars] + f"\n\n... (文件过长，仅显示前{max_preview_chars}字符作为预览。完整内容将用于音频生成。)"
         if chapters:
             preview_content += f"\n\n检测到 {len(chapters)} 个章节，生成M4B格式时将添加章节书签。"
-        return preview_content, filename, content, chapters  # Return preview, filename, full content, and chapters
+        return preview_content, filename, content, chapters, chapters_display_update  # Return preview, filename, full content, chapters, and display update
     
     if chapters:
         content += f"\n\n检测到 {len(chapters)} 个章节，生成M4B格式时将添加章节书签。"
     
-    return content, filename, content, chapters  # Return same content for both preview and full, plus chapters
+    return content, filename, content, chapters, chapters_display_update  # Return same content for both preview and full, plus chapters and display update
 
 def refresh_sample_files():
     """Refresh the list of sample files"""
@@ -1004,130 +1176,237 @@ def on_sample_audio_change(selected_file):
             return gr.update(value=file_path, label="参考音频预览", visible=True)
     return gr.update(value=None, label="参考音频预览", visible=True)
 
-with gr.Blocks(title="IndexTTS Demo") as demo:
+with gr.Blocks(
+    title="IndexTTS Demo",
+    theme=gr.themes.Soft(
+        primary_hue="blue",
+        secondary_hue="slate",
+        neutral_hue="gray"
+    ),
+    css="""
+    .main-container {
+        max-width: 1400px;
+        margin: 0 auto;
+        padding: 20px;
+    }
+    .chapter-display {
+        max-height: 300px;
+        overflow-y: auto;
+        border: 1px solid #e1e5e9;
+        border-radius: 8px;
+        padding: 15px;
+        background: #f8f9fa;
+    }
+    .status-container {
+        border: 1px solid #d1ecf1;
+        border-radius: 8px;
+        padding: 15px;
+        background: #d1ecf1;
+    }
+    .control-panel {
+        background: #ffffff;
+        border: 1px solid #dee2e6;
+        border-radius: 8px;
+        padding: 20px;
+        margin: 10px 0;
+    }
+    .generation-button {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        border: none;
+        color: white;
+        font-weight: bold;
+        font-size: 16px;
+        padding: 12px 24px;
+        border-radius: 8px;
+        transition: all 0.3s ease;
+    }
+    .generation-button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+    }
+    """
+) as demo:
     mutex = threading.Lock()
-    gr.HTML('''
-    <h2><center>IndexTTS: An Industrial-Level Controllable and Efficient Zero-Shot Text-To-Speech System</h2>
-    <h2><center>(一款工业级可控且高效的零样本文本转语音系统)</h2>
-<p align="center">
-<a href='https://arxiv.org/abs/2502.05512'><img src='https://img.shields.io/badge/ArXiv-2502.05512-red'></a>
-</p>
-    ''')
+    with gr.Column(elem_classes="main-container"):
+        gr.HTML('''
+        <div style="text-align: center; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 15px; margin-bottom: 20px;">
+            <h1 style="color: white; margin-bottom: 10px; font-size: 28px;">🎤 IndexTTS</h1>
+            <h3 style="color: #f8f9fa; margin-bottom: 15px;">工业级可控且高效的零样本文本转语音系统</h3>
+            <p style="color: #e9ecef; margin: 0;">
+                <a href='https://arxiv.org/abs/2502.05512' style="color: #ffc107; text-decoration: none;">📄 ArXiv论文</a> • 
+                <span>🚀 高质量语音合成</span> • 
+                <span>⚡ 零样本克隆</span>
+            </p>
+        </div>
+        ''')
     with gr.Tab("音频生成"):
         with gr.Row():
-            with gr.Column(scale=1):
-                # 参考音频选择
-                gr.Markdown("**参考音频选择**")
-                with gr.Row():
-                    sample_files = get_sample_files()
-                    default_choices = sample_files if sample_files else ["无可用文件"]
-                    default_value = sample_files[0] if sample_files else "无可用文件"
+            # 左侧控制面板
+            with gr.Column(scale=3):
+                with gr.Group(elem_classes="control-panel"):
+                    gr.Markdown("### 🎵 参考音频选择")
+                    with gr.Row():
+                        sample_files = get_sample_files()
+                        default_choices = sample_files if sample_files else ["无可用文件"]
+                        default_value = sample_files[0] if sample_files else "无可用文件"
+                        
+                        sample_dropdown = gr.Dropdown(
+                            label="选择样本音频",
+                            choices=default_choices,
+                            value=default_value,
+                            interactive=True
+                        )
+                        refresh_btn = gr.Button("🔄", size="sm", variant="secondary")
                     
-                    sample_dropdown = gr.Dropdown(
-                        label="选择样本音频",
-                        choices=default_choices,
-                        value=default_value,
-                        interactive=True
+                    # 设置默认预览音频
+                    default_audio_path = None
+                    if sample_files:
+                        default_audio_path = os.path.join("samples", sample_files[0])
+                        if not os.path.exists(default_audio_path):
+                            default_audio_path = None
+                    
+                    prompt_audio = gr.Audio(
+                        label="参考音频预览",
+                        key="prompt_audio", 
+                        interactive=False,
+                        value=default_audio_path
                     )
-                    refresh_btn = gr.Button("刷新", size="sm")
                 
-                # 设置默认预览音频
-                default_audio_path = None
-                if sample_files:
-                    default_audio_path = os.path.join("samples", sample_files[0])
-                    if not os.path.exists(default_audio_path):
-                        default_audio_path = None
+                with gr.Group(elem_classes="control-panel"):
+                    gr.Markdown("### 📝 文本输入")
+                    uploaded_file = gr.File(
+                        label="上传文本文件 (支持 .txt 和 .epub)",
+                        file_types=[".txt", ".epub"],
+                        key="uploaded_file"
+                    )
+                    
+                    # EPUB章节列表显示
+                    chapters_display = gr.Markdown(
+                        label="📚 章节信息",
+                        value="",
+                        visible=False,
+                        container=True,
+                        show_copy_button=True
+                    )
                 
-                prompt_audio = gr.Audio(
-                    label="参考音频预览",
-                    key="prompt_audio", 
-                    interactive=False,
-                    value=default_audio_path
-                )
-                
-                # 文件上传区域
-                gr.Markdown("**文本输入**")
-                uploaded_file = gr.File(
-                    label="上传文本文件 (支持 .txt 和 .epub)",
-                    file_types=[".txt", ".epub"],
-                    key="uploaded_file"
-                )
                 uploaded_filename = gr.State("")
                 full_text_content = gr.State("")
                 chapters_info = gr.State([])
                 
-            with gr.Column(scale=2):
-                input_text_single = gr.TextArea(
-                    label="文本内容",
-                    key="input_text_single", 
-                    placeholder="请输入目标文本或上传文件", 
-                    info="当前模型版本{}".format(tts.model_version or "1.0"),
-                    lines=10
+            # 右侧主要内容区域
+            with gr.Column(scale=4):
+                with gr.Group(elem_classes="control-panel"):
+                    input_text_single = gr.TextArea(
+                        label="📄 文本内容",
+                        key="input_text_single", 
+                        placeholder="请输入目标文本或上传文件开始体验...", 
+                        info=f"当前模型版本: {tts.model_version or '1.0'} | 支持中英文混合输入",
+                        lines=8
+                    )
+                
+                with gr.Group(elem_classes="control-panel"):
+                    gr.Markdown("### ⚙️ 生成设置")
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            infer_mode = gr.Radio(
+                                choices=["普通推理", "批次推理"], 
+                                label="🔧 推理模式",
+                                info="批次推理：更适合长句，性能翻倍",
+                                value="普通推理"
+                            )
+                            auto_save = gr.Checkbox(
+                                label="💾 自动保存", 
+                                value=True, 
+                                info="生成完成后自动保存到outputs文件夹"
+                            )
+                            background_mode = gr.Checkbox(
+                                label="🚀 智能后台处理", 
+                                value=True, 
+                                info="长文本自动后台处理，避免连接超时"
+                            )
+                        
+                        with gr.Column(scale=1):
+                            audio_format = gr.Radio(
+                                choices=["WAV", "MP3", "M4B"], 
+                                label="🎵 音频格式",
+                                value="MP3",
+                                info="WAV: 无损 | MP3: 压缩 | M4B: 有声书"
+                            )
+                            audio_bitrate = gr.Slider(
+                                label="🎛️ 音频码率 (kbps)",
+                                minimum=32,
+                                maximum=320,
+                                value=64,
+                                step=32,
+                                info="仅对MP3和M4B格式有效，码率越高音质越好"
+                            )
+                    
+                    # 章节分段设置
+                    with gr.Accordion("📚 章节分段设置", open=True):
+                        with gr.Row():
+                            enable_chapter_split = gr.Checkbox(
+                                label="📂 启用章节分段",
+                                value=False,
+                                info="将音频按章节分割为多个文件并统一管理"
+                            )
+                            chapters_per_file = gr.Slider(
+                                label="📄 每个文件包含章节数",
+                                minimum=1,
+                                maximum=100,
+                                value=1,
+                                step=1,
+                                info="设置每个音频文件包含的章节数量"
+                            )
+                
+                # 生成按钮
+                gen_button = gr.Button(
+                    "🎤 开始生成语音", 
+                    key="gen_button", 
+                    interactive=True, 
+                    variant="primary", 
+                    size="lg",
+                    elem_classes="generation-button"
                 )
                 
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        infer_mode = gr.Radio(
-                            choices=["普通推理", "批次推理"], 
-                            label="推理模式",
-                            info="批次推理：更适合长句，性能翻倍",
-                            value="普通推理"
-                        )
-                    
-                    # 保存设置
-                    with gr.Column(scale=1):
-                        auto_save = gr.Checkbox(label="自动保存", value=True, info="生成完成后自动保存到outputs文件夹")
-                        background_mode = gr.Checkbox(
-                            label="智能后台处理", 
-                            value=True, 
-                            info="长文本自动后台处理，避免连接超时"
-                        )
-                        audio_format = gr.Radio(
-                            choices=["WAV", "MP3", "M4B"], 
-                            label="音频格式",
-                            value="MP3",
-                            info="MP3: 64kbps压缩格式\nM4B: 有声书格式"
-                        )
-                
-                gen_button = gr.Button("生成语音", key="gen_button", interactive=True, variant="primary", size="lg")
-                
-                # 内存管理区域
-                with gr.Row():
-                    clear_cache_btn = gr.Button("清理GPU缓存", variant="secondary", size="sm")
-                    cache_info = gr.Textbox(label="缓存信息", interactive=False, max_lines=4, visible=False)
+                # 内存管理和状态显示区域
+                with gr.Group(elem_classes="control-panel"):
+                    with gr.Row():
+                        clear_cache_btn = gr.Button("🧹 清理GPU缓存", variant="secondary", size="sm")
+                        cache_info = gr.Textbox(label="缓存信息", interactive=False, max_lines=2, visible=False)
                 
                 # 生成状态显示区域
-                with gr.Accordion("生成状态和系统监控", open=True):
-                    with gr.Row():
-                        with gr.Column(scale=2):
-                            status_info = gr.Textbox(
-                                label="当前状态", 
-                                value="等待开始生成...",
-                                interactive=False,
-                                max_lines=3
-                            )
-                            progress_info = gr.Textbox(
-                                label="详细进度",
-                                placeholder="进度信息将在生成过程中显示...",
-                                interactive=False,
-                                max_lines=8,
-                                visible=False
-                            )
-                        with gr.Column(scale=1):
-                            system_info = gr.Textbox(
-                                label="系统信息",
-                                placeholder="系统监控信息将在生成时显示...",
-                                interactive=False,
-                                max_lines=8,
-                                visible=False
-                            )
-                    
-                    error_info = gr.Textbox(
-                        label="错误信息",
-                        interactive=False,
-                        max_lines=4,
-                        visible=False
-                    )
+                with gr.Accordion("📊 生成状态和系统监控", open=True):
+                    with gr.Group(elem_classes="status-container"):
+                        with gr.Row():
+                            with gr.Column(scale=2):
+                                status_info = gr.Textbox(
+                                    label="🔄 当前状态", 
+                                    value="🟡 等待开始生成...",
+                                    interactive=False,
+                                    max_lines=3
+                                )
+                                progress_info = gr.Textbox(
+                                    label="📈 详细进度",
+                                    placeholder="进度信息将在生成过程中显示...",
+                                    interactive=False,
+                                    max_lines=6,
+                                    visible=False
+                                )
+                            with gr.Column(scale=1):
+                                system_info = gr.Textbox(
+                                    label="💻 系统信息",
+                                    placeholder="系统监控信息将在生成时显示...",
+                                    interactive=False,
+                                    max_lines=6,
+                                    visible=False
+                                )
+                        
+                        error_info = gr.Textbox(
+                            label="⚠️ 错误信息",
+                            interactive=False,
+                            max_lines=4,
+                            visible=False
+                        )
                     
         output_audio = gr.Audio(label="生成结果", visible=True, key="output_audio")
         with gr.Accordion("高级生成参数设置", open=False):
@@ -1171,11 +1450,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                 # typical_sampling, typical_mass,
             ]
         
-        if len(example_cases) > 0:
-            gr.Examples(
-                examples=example_cases,
-                inputs=[prompt_audio, input_text_single, infer_mode],
-            )
+        # 已删除示例案例显示组件
     
     # 任务管理页面
     with gr.Tab("任务管理"):
@@ -1340,7 +1615,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
     uploaded_file.upload(
         process_uploaded_file,
         inputs=[uploaded_file],
-        outputs=[input_text_single, uploaded_filename, full_text_content, chapters_info]
+        outputs=[input_text_single, uploaded_filename, full_text_content, chapters_info, chapters_display]
     )
 
     # Handle generation with new parameters
@@ -1349,7 +1624,8 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         inputs=[
             prompt_audio, input_text_single, infer_mode,
             max_text_tokens_per_sentence, sentences_bucket_max_size,
-            auto_save, audio_format, uploaded_filename, sample_dropdown, full_text_content, chapters_info, background_mode,
+            auto_save, audio_format, audio_bitrate, enable_chapter_split, chapters_per_file,
+            uploaded_filename, sample_dropdown, full_text_content, chapters_info, background_mode,
             *advanced_params,
         ],
         outputs=[output_audio, status_info, progress_info, system_info, error_info]

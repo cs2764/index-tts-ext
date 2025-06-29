@@ -332,13 +332,15 @@ class IndexTTS:
     def format_time(self, seconds):
         """格式化时间为人类可读格式"""
         if seconds < 60:
-            return f"{seconds:.1f}秒"
+            return f"{int(seconds)}秒"
         elif seconds < 3600:
-            minutes = seconds / 60
-            return f"{minutes:.1f}分钟"
+            minutes = int(seconds // 60)
+            secs = int(seconds % 60)
+            return f"{minutes}分{secs}秒"
         else:
-            hours = seconds / 3600
-            return f"{hours:.1f}小时"
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            return f"{hours}小时{minutes}分钟"
     
     def get_system_info(self, force_refresh=True):
         """获取系统信息包括显存、内存使用情况"""
@@ -351,28 +353,42 @@ class IndexTTS:
         if "cuda" in str(self.device):
             try:
                 import torch
-                # 强制同步确保获取最新的显存使用情况
+                # 多重强制同步确保获取最新的显存使用情况
                 if force_refresh:
                     torch.cuda.synchronize(self.device)
+                    torch.cuda.empty_cache()  # 清理缓存确保准确性
+                    torch.cuda.synchronize(self.device)  # 再次同步
                 
+                # 获取真实的GPU显存使用情况
                 gpu_memory_allocated = torch.cuda.memory_allocated(self.device) / 1024**3  # GB
                 gpu_memory_reserved = torch.cuda.memory_reserved(self.device) / 1024**3  # GB
                 gpu_memory_total = torch.cuda.get_device_properties(self.device).total_memory / 1024**3  # GB
+                
+                # 计算实际使用率（基于已分配内存）
+                gpu_usage_percent = (gpu_memory_allocated / gpu_memory_total) * 100
                 
                 system_info.update({
                     "gpu_memory_allocated": gpu_memory_allocated,
                     "gpu_memory_reserved": gpu_memory_reserved,
                     "gpu_memory_total": gpu_memory_total,
-                    "gpu_memory_usage_percent": (gpu_memory_allocated / gpu_memory_total) * 100,
-                    "gpu_name": torch.cuda.get_device_name(self.device)
+                    "gpu_memory_usage_percent": gpu_usage_percent,
+                    "gpu_name": torch.cuda.get_device_name(self.device),
+                    "gpu_device_index": self.device.index if hasattr(self.device, 'index') else 0
                 })
+                
+                # 添加详细的显存统计（用于调试）
+                if force_refresh:
+                    memory_summary = torch.cuda.memory_summary(self.device)
+                    system_info["gpu_memory_summary"] = memory_summary
+                    
             except Exception as e:
                 system_info["gpu_error"] = str(e)
+                print(f"GPU信息获取错误: {e}")
         
         # CPU和内存信息
         try:
             # 使用较短的interval确保实时性
-            cpu_percent = psutil.cpu_percent(interval=0.05)
+            cpu_percent = psutil.cpu_percent(interval=0.01)  # 更短的interval
             memory = psutil.virtual_memory()
             
             system_info.update({
@@ -387,52 +403,193 @@ class IndexTTS:
             
         return system_info
 
+    def _calculate_smart_eta(self, elapsed_time, current_item, total_items, batch_times=None):
+        """智能ETA计算算法融合多种预测方法"""
+        if current_item <= 0 or total_items <= 0:
+            return None, "数据不足"
+            
+        progress_percent = current_item / total_items
+        remaining_items = total_items - current_item
+        
+        predictions = []
+        confidence_scores = []
+        
+        # 1. 线性预测（基础预测）
+        linear_eta = (elapsed_time / current_item) * remaining_items
+        predictions.append(linear_eta)
+        confidence_scores.append(0.3)  # 基础权重
+        
+        # 2. 批次时间预测（如果有批次数据）
+        if batch_times and len(batch_times) > 0:
+            # 过滤异常值（超过中位数2倍的时间）
+            filtered_times = self._filter_outliers(batch_times)
+            
+            if len(filtered_times) >= 2:
+                # 指数加权移动平均（EWMA）
+                alpha = 0.3  # 平滑系数
+                ewma_time = filtered_times[0]
+                for t in filtered_times[1:]:
+                    ewma_time = alpha * t + (1 - alpha) * ewma_time
+                
+                batch_eta = ewma_time * remaining_items
+                predictions.append(batch_eta)
+                confidence_scores.append(min(0.7, len(filtered_times) * 0.1))  # 根据数据量调整权重
+                
+                # 3. 趋势预测（基于最近趋势）
+                if len(filtered_times) >= 3:
+                    recent_times = filtered_times[-3:]
+                    if len(recent_times) >= 2:
+                        # 计算趋势斜率
+                        x = list(range(len(recent_times)))
+                        y = recent_times
+                        
+                        # 简单线性回归
+                        n = len(x)
+                        sum_x = sum(x)
+                        sum_y = sum(y)
+                        sum_xy = sum(x[i] * y[i] for i in range(n))
+                        sum_x2 = sum(x[i] * x[i] for i in range(n))
+                        
+                        if n * sum_x2 - sum_x * sum_x != 0:
+                            slope = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x * sum_x)
+                            intercept = (sum_y - slope * sum_x) / n
+                            
+                            # 预测下一个批次时间
+                            next_batch_time = slope * len(recent_times) + intercept
+                            next_batch_time = max(0.1, next_batch_time)  # 防止负值或过小值
+                            
+                            trend_eta = next_batch_time * remaining_items
+                            predictions.append(trend_eta)
+                            confidence_scores.append(0.4)
+        
+        # 4. 基于进度阶段的调整
+        stage_multiplier = 1.0
+        if progress_percent < 0.1:
+            # 初始阶段，时间可能不稳定
+            stage_multiplier = 1.2
+        elif progress_percent > 0.8:
+            # 接近完成，通常会加速
+            stage_multiplier = 0.9
+        
+        # 5. 计算加权平均
+        if len(predictions) > 0:
+            total_weight = sum(confidence_scores)
+            if total_weight > 0:
+                weighted_eta = sum(pred * weight for pred, weight in zip(predictions, confidence_scores)) / total_weight
+            else:
+                weighted_eta = predictions[0]
+                
+            # 应用阶段调整
+            weighted_eta *= stage_multiplier
+            
+            # 6. 平滑处理，避免剧烈波动
+            if hasattr(self, '_last_eta') and self._last_eta is not None:
+                # 使用指数平滑
+                smooth_factor = 0.7  # 平滑系数
+                weighted_eta = smooth_factor * weighted_eta + (1 - smooth_factor) * self._last_eta
+            
+            self._last_eta = weighted_eta
+            
+            # 生成置信度描述
+            confidence_level = min(total_weight, 1.0)
+            if confidence_level > 0.8:
+                confidence_desc = "高精度"
+            elif confidence_level > 0.5:
+                confidence_desc = "中等精度"
+            else:
+                confidence_desc = "预估"
+                
+            return weighted_eta, confidence_desc
+        
+        return linear_eta, "基础预估"
+    
+    def _filter_outliers(self, times, threshold=2.0):
+        """过滤异常值"""
+        if len(times) < 3:
+            return times
+            
+        # 计算中位数和中位数绝对偏差
+        sorted_times = sorted(times)
+        median = sorted_times[len(sorted_times) // 2]
+        
+        # 过滤超过阈值的值
+        filtered = []
+        for t in times:
+            if t <= median * threshold and t >= median / threshold:
+                filtered.append(t)
+        
+        # 如果过滤后数据太少，保留原始数据
+        return filtered if len(filtered) >= len(times) // 2 else times
+    
+    def _get_speed_info(self, batch_times, current_item, elapsed_time):
+        """获取速度信息"""
+        if not batch_times or len(batch_times) == 0:
+            return ""
+            
+        # 当前速度
+        if len(batch_times) > 0:
+            current_speed = 1.0 / batch_times[-1] if batch_times[-1] > 0 else 0
+            current_speed_text = f"{current_speed:.1f}/s"
+        else:
+            current_speed_text = "计算中"
+            
+        # 平均速度
+        if elapsed_time > 0 and current_item > 0:
+            avg_speed = current_item / elapsed_time
+            avg_speed_text = f"{avg_speed:.1f}/s"
+        else:
+            avg_speed_text = "计算中"
+            
+        return f"\n⚡ 处理速度: 当前 {current_speed_text} | 平均 {avg_speed_text}"
+
     def _set_gr_progress(self, value, desc, start_time=None, total_items=None, current_item=None, batch_times=None):
-        """增强的进度更新，包含时间估算和系统信息"""
+        """智能进度更新，包含高级时间估算和系统信息"""
         # 获取实时系统信息
         system_info = self.get_system_info(force_refresh=True)
         
         # 时间计算
         time_info = ""
+        confidence_desc = ""
+        
         if start_time is not None:
             elapsed_time = time.perf_counter() - start_time
             elapsed_formatted = self.format_time(elapsed_time)
             
             if total_items and current_item and current_item > 0:
-                # 基于批次时间的智能预测
-                if batch_times and len(batch_times) > 0:
-                    # 使用最近几个批次的平均时间进行预测
-                    recent_batches = batch_times[-min(3, len(batch_times)):]  # 最近3个批次
-                    avg_batch_time = sum(recent_batches) / len(recent_batches)
-                    remaining_batches = total_items - current_item
-                    estimated_remaining = avg_batch_time * remaining_batches
-                    
+                # 使用智能ETA算法
+                estimated_remaining, confidence = self._calculate_smart_eta(
+                    elapsed_time, current_item, total_items, batch_times
+                )
+                
+                if estimated_remaining is not None:
                     remaining_formatted = self.format_time(estimated_remaining)
-                    time_info = f"\n⏱️ 已用时: {elapsed_formatted} | 预计剩余: {remaining_formatted}"
+                    time_info = f"\n⏱️ 已用时: {elapsed_formatted} | 预计剩余: {remaining_formatted} ({confidence})"
+                    confidence_desc = confidence
                     
-                    # 添加批次速度信息
-                    if len(batch_times) > 1:
+                    # 添加速度信息
+                    speed_info = self._get_speed_info(batch_times, current_item, elapsed_time)
+                    time_info += speed_info
+                    
+                    # 添加批次详情（如果有批次数据）
+                    if batch_times and len(batch_times) > 1:
                         last_batch_time = batch_times[-1]
+                        filtered_times = self._filter_outliers(batch_times)
+                        avg_batch_time = sum(filtered_times) / len(filtered_times)
+                        
                         last_batch_formatted = self.format_time(last_batch_time)
-                        time_info += f"\n📊 当前批次: {last_batch_formatted} | 平均批次: {self.format_time(avg_batch_time)}"
+                        avg_batch_formatted = self.format_time(avg_batch_time)
+                        time_info += f"\n📊 当前批次: {last_batch_formatted} | 平均批次: {avg_batch_formatted}"
+                        
+                        # 显示进度百分比和剩余项目
+                        progress_percent = (current_item / total_items) * 100
+                        time_info += f"\n📈 进度: {current_item}/{total_items} ({progress_percent:.1f}%)"
                 else:
-                    # 回退到简单的线性预测
-                    time_per_item = elapsed_time / current_item
-                    remaining_items = total_items - current_item
-                    estimated_remaining = time_per_item * remaining_items
-                    
-                    remaining_formatted = self.format_time(estimated_remaining)
-                    time_info = f"\n⏱️ 已用时: {elapsed_formatted} | 预计剩余: {remaining_formatted}"
+                    time_info = f"\n⏱️ 已用时: {elapsed_formatted} | 预计剩余: 计算中..."
             else:
                 time_info = f"\n⏱️ 已用时: {elapsed_formatted}"
         
-        # 构建系统信息字符串
+        # 构建系统信息字符串（移除GPU信息）
         sys_info = ""
-        if "gpu_memory_allocated" in system_info:
-            gpu_usage = system_info["gpu_memory_usage_percent"]
-            gpu_used = system_info["gpu_memory_allocated"]
-            gpu_total = system_info["gpu_memory_total"]
-            sys_info += f"\n🎮 GPU: {gpu_used:.1f}/{gpu_total:.1f}GB ({gpu_usage:.1f}%)"
         
         if "memory_percent" in system_info:
             mem_percent = system_info["memory_percent"]
@@ -451,13 +608,29 @@ class IndexTTS:
         if self.gr_progress is not None:
             self.gr_progress(value, desc=full_desc)
         
-        # 控制台输出（简化版本）
+        # 控制台输出（智能版本）
         console_msg = f">> 进度 {value*100:.1f}%: {desc}"
+        
+        # 添加时间信息
         if start_time:
             elapsed = time.perf_counter() - start_time
-            console_msg += f" (已用时: {self.format_time(elapsed)})"
-        if "gpu_memory_allocated" in system_info:
-            console_msg += f" [GPU: {system_info['gpu_memory_allocated']:.1f}GB]"
+            console_msg += f" (已用时: {self.format_time(elapsed)}"
+            
+            # 添加智能预计剩余时间
+            if total_items and current_item and current_item > 0:
+                estimated_remaining, confidence = self._calculate_smart_eta(
+                    elapsed, current_item, total_items, batch_times
+                )
+                
+                if estimated_remaining is not None:
+                    remaining_formatted = self.format_time(estimated_remaining)
+                    console_msg += f", 预计剩余: {remaining_formatted}"
+                    if confidence != "基础预估":
+                        console_msg += f" [{confidence}]"
+                else:
+                    console_msg += ", 预计剩余: 计算中"
+            console_msg += ")"
+        
         print(console_msg)
 
     # 快速推理：对于"多句长文本"，可实现至少 2~10 倍以上的速度提升~ （First modified by sunnyboxs 2025-04-16）

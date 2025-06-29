@@ -1,3 +1,30 @@
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "indextts"
+version = "0.2.0"
+description = "An Industrial-Level Controllable and Efficient Zero-Shot Text-To-Speech System"
+authors = [
+    {name = "Index SpeechTeam", email = "xuanwu@bilibili.com"}
+]
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+keywords = ["TTS", "text-to-speech", "AI", "voice-cloning", "zero-shot"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3.10",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: Apache Software License",
+]
+
+[project.urls]
+Homepage = "https://github.com/cs2764/index-tts-ext"
+Documentation = "https://github.com/cs2764/index-tts-ext/blob/main/README.md"
+Repository = "https://github.com/cs2764/index-tts-exts"
+Issues = "https://github.com/cs2764/index-tts-ext/issues"
