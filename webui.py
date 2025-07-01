@@ -14,6 +14,9 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 import uuid
+import re
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -30,7 +33,7 @@ sys.path.append(os.path.join(current_dir, "indextts"))
 import argparse
 parser = argparse.ArgumentParser(description="IndexTTS WebUI")
 parser.add_argument("--verbose", action="store_true", default=False, help="Enable verbose mode")
-parser.add_argument("--port", type=int, default=7860, help="Port to run the web UI on")
+parser.add_argument("--port", type=int, default=7863, help="Port to run the web UI on")
 parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the web UI on")
 parser.add_argument("--model_dir", type=str, default="checkpoints", help="Model checkpoints directory")
 cmd_args = parser.parse_args()
@@ -60,11 +63,287 @@ i18n = I18nAuto(language="zh_CN")
 MODE = 'local'
 tts = IndexTTS(model_dir=cmd_args.model_dir, cfg_path=os.path.join(cmd_args.model_dir, "config.yaml"),)
 
+# Try to import chardet for encoding detection, fallback if not available
+try:
+    import chardet
+    HAS_CHARDET = True
+except ImportError:
+    HAS_CHARDET = False
+    print("Warning: chardet not available, using utf-8 as default encoding")
+
+# --- Smart Chapter Parser Data Structures ---
+
+@dataclass
+class Chapter:
+    """最终输出的章节结构"""
+    title: str
+    content: str
+
+@dataclass
+class PotentialChapter:
+    """用于内部处理的候选章节结构"""
+    title_text: str
+    start_index: int
+    end_index: int
+    confidence_score: int
+    pattern_type: str
+
+    def __repr__(self):
+        return f"'{self.title_text}' (Score: {self.confidence_score}, Pos: {self.start_index})"
+
+# --- Smart Chapter Parser Class ---
+
+class SmartChapterParser:
+    """
+    一个智能中文章节解析器，能够从纯文本中识别章节并提取内容。
+    """
+
+    def __init__(self,
+                 min_chapter_distance: int = 50,
+                 merge_title_distance: int = 25):
+        """
+        初始化解析器。
+        :param min_chapter_distance: 两个章节标题之间的最小字符距离，用于过滤伪章节。
+        :param merge_title_distance: 两行文字被视作同一标题的最大字符距离。
+        """
+        self.min_chapter_distance = min_chapter_distance
+        self.merge_title_distance = merge_title_distance
+
+        # 定义模式，按置信度从高到低排列
+        self.patterns = [
+            # 高置信度: 第X章/回/节/卷
+            ("结构化模式", 100, re.compile(r"^\s*(第|卷)\s*[一二三四五六七八九十百千万零\d]+\s*[章回节卷].*$", re.MULTILINE)),
+            # 中高置信度: 关键词
+            ("关键词模式", 80, re.compile(r"^\s*(序|前言|引子|楔子|后记|番外|尾声|序章|序幕)\s*$", re.MULTILINE)),
+            # 【更新】为处理 (一)少年 / (1) / （2）少年 / （卅五）赌船嬉戏 等格式，加入专用模式并提高其置信度
+            ("全半角括号模式", 65, re.compile(r"^\s*[（(]\s*[一二三四五六七八九十百千万零廿卅卌\d]+\s*[)）]\s*.*$", re.MULTILINE)),
+            # 中置信度: 普通序号列表（包含特殊中文数字简写）
+            ("序号模式", 60, re.compile(r"^\s*[一二三四五六七八九十百千万廿卅卌\d]+\s*[、.．].*$", re.MULTILINE)),
+            # 低置信度: 启发式短标题 - 加强过滤条件
+            ("启发式模式", 30, re.compile(r"^\s*[^。\n！？]{1,15}\s*$", re.MULTILINE))
+        ]
+        
+        # 定义排除模式，用于过滤明显不是章节的内容
+        self.exclusion_patterns = [
+            # 文件名和URL
+            re.compile(r'.*\.(html?|htm|txt|doc|pdf|jpg|png|gif|css|js)$', re.IGNORECASE),
+            # 纯数字或数字+文件扩展名
+            re.compile(r'^\s*\d+(\.\w+)?\s*$'),
+            # 包含URL特征
+            re.compile(r'.*(http|www|\.com|\.cn|\.org).*', re.IGNORECASE),
+            # 包含代码特征
+            re.compile(r'.*[<>{}[\]();=&%#].*'),
+            # 包含过多数字的行（如日期、ID等）
+            re.compile(r'^\s*\d{4,}\s*$'),
+            # HTML标签
+            re.compile(r'<[^>]+>'),
+            # 特殊符号开头
+            re.compile(r'^\s*[*+\-=_~`]+\s*$'),
+        ]
+
+    def _preprocess(self, text: str) -> str:
+        """文本预处理，规范化空白符。"""
+        text = text.replace('　', ' ')
+        return text
+
+    def _scan_for_candidates(self, text: str) -> List[PotentialChapter]:
+        """
+        多模式扫描文本，生成所有可能的候选章节列表。
+        """
+        candidates = []
+        for pattern_type, score, regex in self.patterns:
+            for match in regex.finditer(text):
+                title_text = match.group(0).strip()
+                
+                # 检查排除模式
+                should_exclude = False
+                for exclusion_pattern in self.exclusion_patterns:
+                    if exclusion_pattern.match(title_text):
+                        should_exclude = True
+                        break
+                
+                if should_exclude:
+                    continue
+                
+                if pattern_type == "启发式模式":
+                    start_line = text.rfind('\n', 0, match.start()) + 1
+                    end_line = text.find('\n', match.end())
+                    if end_line == -1: end_line = len(text)
+                    
+                    prev_line = text[text.rfind('\n', 0, start_line-2)+1:start_line-1].strip()
+                    next_line = text[end_line+1:text.find('\n', end_line+1)].strip()
+
+                    if not (prev_line == "" and next_line == ""):
+                        continue 
+                    
+                    # 对启发式模式进行额外检查
+                    # 排除纯数字或过短的标题
+                    if len(title_text) < 2 or title_text.isdigit():
+                        continue
+                    
+                    # 排除只包含数字和标点的标题
+                    if re.match(r'^[\d\s\.\-_]+$', title_text):
+                        continue
+
+                is_duplicate = False
+                for cand in candidates:
+                    if cand.start_index == match.start():
+                        is_duplicate = True
+                        break
+                if not is_duplicate:
+                    candidates.append(PotentialChapter(
+                        title_text=title_text,
+                        start_index=match.start(),
+                        end_index=match.end(),
+                        confidence_score=score,
+                        pattern_type=pattern_type
+                    ))
+        return sorted(candidates, key=lambda x: x.start_index)
+        
+    def _filter_and_merge_candidates(self, candidates: List[PotentialChapter]) -> List[PotentialChapter]:
+        """
+        过滤、消歧和合并候选章节，这是算法的智能核心。
+        """
+        if not candidates:
+            return []
+
+        # 按置信度降序排序，优先保留高置信度的章节
+        sorted_candidates = sorted(candidates, key=lambda x: (-x.confidence_score, x.start_index))
+        
+        final_candidates = []
+        
+        for current in sorted_candidates:
+            should_add = True
+            
+            # 检查与已接受章节的距离
+            for accepted in final_candidates:
+                char_distance = abs(current.start_index - accepted.start_index)
+                
+                # 动态调整最小距离要求
+                if current.confidence_score >= 80 and accepted.confidence_score >= 80:
+                    # 高置信度章节之间允许更近的距离
+                    min_distance = 15  
+                elif current.confidence_score >= 60 and accepted.confidence_score >= 60:
+                    # 中等置信度章节之间的距离
+                    min_distance = 30
+                else:
+                    # 低置信度章节需要更大的距离
+                    min_distance = self.min_chapter_distance
+                
+                if char_distance < min_distance:
+                    should_add = False
+                    break
+            
+            if should_add:
+                final_candidates.append(current)
+        
+        # 按位置重新排序
+        final_candidates.sort(key=lambda x: x.start_index)
+        
+        return final_candidates
+
+    def _extract_content(self, text: str, chapters: List[PotentialChapter]) -> List[Chapter]:
+        """
+        根据最终的章节标记列表，切分文本并提取内容。
+        """
+        if not chapters:
+            return [Chapter(title="全文", content=text.strip())]
+
+        final_chapters = []
+        
+        first_chapter_start = chapters[0].start_index
+        if first_chapter_start > 0:
+            prologue_content = text[:first_chapter_start].strip()
+            if prologue_content:
+                final_chapters.append(Chapter(title="前言", content=prologue_content))
+
+        for i in range(len(chapters)):
+            current_chap = chapters[i]
+            
+            if i + 1 < len(chapters):
+                next_chap_start = chapters[i+1].start_index
+            else:
+                next_chap_start = len(text)
+                
+            content_start = current_chap.end_index
+            content = text[content_start:next_chap_start].strip()
+
+            final_chapters.append(Chapter(title=current_chap.title_text, content=content))
+            
+        return final_chapters
+
+    def parse(self, text: str) -> List[Chapter]:
+        """
+        执行完整的解析流程。
+        :param text: 完整的文章纯文本。
+        :return: 一个包含Chapter对象的列表。
+        """
+        processed_text = self._preprocess(text)
+        candidates = self._scan_for_candidates(processed_text)
+        final_chapter_markers = self._filter_and_merge_candidates(candidates)
+        result = self._extract_content(processed_text, final_chapter_markers)
+        return result
+
+# --- Text Cleaning Functions ---
+
+def clean_text(text, merge_lines=True, remove_spaces=True):
+    """清理文本"""
+    if merge_lines:
+        text = re.sub(r'\n\s*\n', '\n', text)
+    if remove_spaces:
+        text = '\n'.join(line.strip() for line in text.split('\n'))
+    return text
+
+def detect_file_encoding(file_path):
+    """检测文件编码"""
+    if HAS_CHARDET:
+        with open(file_path, 'rb') as f:
+            raw_data = f.read()
+        detection = chardet.detect(raw_data)
+        return detection['encoding'] if detection['encoding'] else 'utf-8'
+    else:
+        return 'utf-8'
+
+def smart_chinese_chapter_detection(text):
+    """
+    使用智能中文章节解析器进行章节检测
+    """
+    try:
+        parser = SmartChapterParser()
+        chapters = parser.parse(text)
+        
+        # 转换为webui期望的格式 
+        result_chapters = []
+        current_pos = 0
+        
+        for chapter in chapters:
+            # 查找章节标题在原文中的位置
+            title_pos = text.find(chapter.title, current_pos)
+            if title_pos == -1:
+                title_pos = current_pos
+            
+            result_chapters.append({
+                'title': chapter.title,
+                'content': chapter.content,
+                'start_pos': title_pos
+            })
+            current_pos = title_pos + len(chapter.title)
+        
+        return result_chapters
+    except Exception as e:
+        print(f"Smart Chinese parser error: {str(e)}")
+        return []
+
 # 后台任务管理
 task_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="TTS_Task")
 task_queue = Queue()
 task_status = {}  # 任务状态字典: {task_id: {"status": str, "progress": str, "result": str, "error": str}}
 task_lock = threading.Lock()
+
+# 批量任务管理
+batch_task_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="Batch_TTS_Task")
+batch_task_status = {}
+batch_task_lock = threading.Lock()
 
 os.makedirs("outputs", exist_ok=True)
 os.makedirs("prompts",exist_ok=True)
@@ -84,15 +363,15 @@ def read_txt_file(file_path):
             return ""
 
 def format_chapters_display(chapters):
-    """Format chapters information for display"""
+    """Format chapters information for display with enhanced smart parsing support"""
     if not chapters or len(chapters) == 0:
         return gr.update(visible=False, value="")
     
     # Create formatted chapter list with better spacing and structure
     chapter_info = []
-    chapter_info.append("📚 **EPUB章节列表**")
+    chapter_info.append("📚 **智能章节解析结果**")
     chapter_info.append("---")  # 分隔线
-    chapter_info.append(f"📖 共检测到 **{len(chapters)}** 个章节")
+    chapter_info.append(f"🧠 智能检测到 **{len(chapters)}** 个章节")
     chapter_info.append("")  # 空行分隔
     
     # 限制显示的章节数量，避免界面过长
@@ -106,8 +385,13 @@ def format_chapters_display(chapters):
         if len(chapter.get('content', '')) > 35:
             content_preview += "..."
         
+        # 显示章节类型信息（如果有的话）
+        chapter_type = ""
+        if hasattr(chapter, 'pattern_type'):
+            chapter_type = f" `{chapter.pattern_type}`"
+        
         # 使用更清晰的格式，增加视觉层次
-        chapter_info.append(f"### 📄 {i}. {title}")
+        chapter_info.append(f"### 📄 {i}. {title}{chapter_type}")
         chapter_info.append(f"> 💭 {content_preview}")
         chapter_info.append("")  # 每个章节后添加空行分隔
     
@@ -120,16 +404,18 @@ def format_chapters_display(chapters):
     
     # 使用提示部分，格式更清晰
     chapter_info.append("---")
-    chapter_info.append("💡 **使用提示**")
+    chapter_info.append("💡 **智能解析提示**")
     chapter_info.append("")
+    chapter_info.append("🧠 使用智能中文章节解析器，支持多种章节格式")
     chapter_info.append("🔸 启用「章节分段」功能可将音频按章节分割")
     chapter_info.append("🔸 生成M4B格式时会自动添加章节书签")
     chapter_info.append("🔸 分段文件将保存在统一的文件夹中")
+    chapter_info.append("🔧 支持：第X章、卷X、序言、(一)章节 等格式")
     
     return gr.update(visible=True, value="\n".join(chapter_info))
 
 def read_epub_file(file_path):
-    """Read text from epub file"""
+    """Read text from epub file with enhanced chapter detection"""
     try:
         import ebooklib
         from ebooklib import epub
@@ -138,42 +424,19 @@ def read_epub_file(file_path):
         
         book = epub.read_epub(file_path)
         text_content = []
-        chapters = []
         
         for item in book.get_items():
             if item.get_type() == ebooklib.ITEM_DOCUMENT:
                 soup = BeautifulSoup(item.get_content(), 'html.parser')
                 content = soup.get_text()
-                
-                # Try to extract chapter title from the content or filename
-                chapter_title = None
-                
-                # Look for chapter titles in h1, h2, h3 tags
-                for tag in soup.find_all(['h1', 'h2', 'h3']):
-                    title_text = tag.get_text().strip()
-                    if title_text and (re.search(r'第.{1,10}章|chapter|Chapter|CHAPTER', title_text) or len(title_text) < 100):
-                        chapter_title = title_text
-                        break
-                
-                # If no title found, use filename or create generic title
-                if not chapter_title:
-                    filename = getattr(item, 'file_name', '')
-                    if filename:
-                        chapter_title = filename.replace('.xhtml', '').replace('.html', '')
-                    else:
-                        chapter_title = f"章节 {len(chapters) + 1}"
-                
-                # Record chapter start position
-                current_length = len('\n'.join(text_content))
                 if content.strip():  # Only add if content is not empty
-                    chapters.append({
-                        'title': chapter_title,
-                        'start_pos': current_length,
-                        'content': content
-                    })
                     text_content.append(content)
         
         full_text = '\n'.join(text_content)
+        
+        # 使用智能中文章节解析器重新检测章节
+        chapters = smart_chinese_chapter_detection(full_text)
+        
         return full_text, chapters
         
     except ImportError:
@@ -515,6 +778,214 @@ def clear_completed_tasks():
         
         for task_id in completed_tasks:
             del task_status[task_id]
+        
+        return len(completed_tasks)
+
+# --- 批量处理功能 ---
+
+def update_batch_task_status(task_id, status=None, progress=None, current_file=None, total_files=None, completed_files=None, error=None):
+    """更新批量任务状态"""
+    with batch_task_lock:
+        if task_id not in batch_task_status:
+            batch_task_status[task_id] = {
+                "status": "unknown", 
+                "progress": "", 
+                "current_file": "", 
+                "total_files": 0,
+                "completed_files": 0,
+                "results": [],
+                "error": ""
+            }
+        
+        if status is not None:
+            batch_task_status[task_id]["status"] = status
+        if progress is not None:
+            batch_task_status[task_id]["progress"] = progress
+        if current_file is not None:
+            batch_task_status[task_id]["current_file"] = current_file
+        if total_files is not None:
+            batch_task_status[task_id]["total_files"] = total_files
+        if completed_files is not None:
+            batch_task_status[task_id]["completed_files"] = completed_files
+        if error is not None:
+            batch_task_status[task_id]["error"] = error
+
+def get_batch_task_status(task_id):
+    """获取批量任务状态"""
+    with batch_task_lock:
+        return batch_task_status.get(task_id, {"status": "not_found", "progress": "", "error": "任务不存在"})
+
+def add_batch_result(task_id, file_name, result_path, status):
+    """添加批量任务结果"""
+    with batch_task_lock:
+        if task_id in batch_task_status:
+            batch_task_status[task_id]["results"].append({
+                "file_name": file_name,
+                "result_path": result_path,
+                "status": status
+            })
+
+def batch_audio_generation(task_id, files, prompt_path, infer_mode, max_text_tokens_per_sentence, 
+                          sentences_bucket_max_size, audio_format, audio_bitrate, 
+                          clean_options, chapter_detection_mode, kwargs):
+    """批量音频生成后台任务"""
+    try:
+        print(f"=== 批量任务 {task_id} 开始 ===")
+        total_files = len(files)
+        update_batch_task_status(task_id, status="🚀 初始化", progress="正在准备批量生成...", total_files=total_files, completed_files=0)
+        
+        # 创建批量输出文件夹
+        date = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        batch_folder = os.path.join("outputs", f"batch_{date}")
+        os.makedirs(batch_folder, exist_ok=True)
+        
+        completed = 0
+        failed = 0
+        
+        for i, file_obj in enumerate(files):
+            try:
+                file_name = os.path.basename(file_obj.name)
+                print(f"[Batch {task_id}] 处理文件 {i+1}/{total_files}: {file_name}")
+                
+                update_batch_task_status(
+                    task_id, 
+                    status="🎵 生成中", 
+                    progress=f"正在处理文件 {i+1}/{total_files}",
+                    current_file=file_name,
+                    completed_files=completed
+                )
+                
+                # 检测文件编码并读取内容
+                encoding = detect_file_encoding(file_obj.name)
+                print(f"[Batch {task_id}] 检测到文件编码: {encoding}")
+                
+                with open(file_obj.name, 'r', encoding=encoding, errors='replace') as f:
+                    text_content = f.read()
+                
+                # 文本清理
+                if clean_options:
+                    merge_lines = "合并空行" in clean_options
+                    remove_spaces = "移除多余空格" in clean_options
+                    text_content = clean_text(text_content, merge_lines, remove_spaces)
+                
+                # 章节检测
+                chapters = []
+                if chapter_detection_mode == "智能中文解析":
+                    chapters = smart_chinese_chapter_detection(text_content)
+                    print(f"[Batch {task_id}] 智能章节检测完成，发现 {len(chapters)} 个章节")
+                
+                # 设置输出文件名
+                base_name = os.path.splitext(file_name)[0]
+                speaker_name = get_speaker_name_from_path(prompt_path)
+                
+                if audio_format == "MP3":
+                    output_path = os.path.join(batch_folder, f"{base_name}_{speaker_name}.mp3")
+                    temp_wav_path = os.path.join(batch_folder, f"temp_{base_name}_{int(time.time())}.wav")
+                elif audio_format == "M4B":
+                    output_path = os.path.join(batch_folder, f"{base_name}_{speaker_name}.m4b")
+                    temp_wav_path = os.path.join(batch_folder, f"temp_{base_name}_{int(time.time())}.wav")
+                else:  # WAV
+                    output_path = os.path.join(batch_folder, f"{base_name}_{speaker_name}.wav")
+                    temp_wav_path = output_path
+                
+                # 生成音频
+                print(f"[Batch {task_id}] 开始生成音频: {output_path}")
+                start_time = time.time()
+                
+                if infer_mode == "普通推理":
+                    wav_output = tts.infer(prompt_path, text_content, temp_wav_path, verbose=cmd_args.verbose,
+                                       max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
+                                       **kwargs)
+                else:
+                    # 批次推理
+                    wav_output = tts.infer_fast(prompt_path, text_content, temp_wav_path, verbose=cmd_args.verbose,
+                        max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
+                        sentences_bucket_max_size=sentences_bucket_max_size,
+                        **kwargs)
+                
+                generation_time = time.time() - start_time
+                print(f"[Batch {task_id}] 音频生成完成，耗时: {generation_time:.2f} 秒")
+                
+                # 格式转换
+                final_output = wav_output
+                if audio_format != "WAV":
+                    print(f"[Batch {task_id}] 转换音频格式到 {audio_format}...")
+                    if audio_format == "MP3":
+                        if convert_audio_format(wav_output, output_path, "mp3", f"{audio_bitrate}k"):
+                            final_output = output_path
+                            if os.path.exists(temp_wav_path) and temp_wav_path != output_path:
+                                os.remove(temp_wav_path)
+                    elif audio_format == "M4B":
+                        if convert_audio_format(wav_output, output_path, "m4b", f"{audio_bitrate}k", chapters):
+                            final_output = output_path
+                            if os.path.exists(temp_wav_path) and temp_wav_path != output_path:
+                                os.remove(temp_wav_path)
+                
+                completed += 1
+                add_batch_result(task_id, file_name, final_output, "✅ 成功")
+                print(f"[Batch {task_id}] 文件处理完成: {file_name}")
+                
+            except Exception as e:
+                failed += 1
+                error_msg = f"处理文件 {file_name} 时出错: {str(e)}"
+                print(f"[Batch {task_id}] ERROR: {error_msg}")
+                add_batch_result(task_id, file_name, "", f"❌ 失败: {str(e)}")
+        
+        # 批量任务完成
+        success_info = f"✅ 批量生成完成！\n📁 输出文件夹: {os.path.basename(batch_folder)}\n✅ 成功: {completed} 个文件\n❌ 失败: {failed} 个文件"
+        update_batch_task_status(task_id, 
+                               status="✅ 完成", 
+                               progress=success_info,
+                               completed_files=completed)
+        
+        print(f"=== 批量任务 {task_id} 完成 ===")
+        
+    except Exception as e:
+        error_msg = f"❌ 批量生成时发生错误: {str(e)}"
+        print(f"[Batch {task_id}] CRITICAL ERROR: {error_msg}")
+        import traceback
+        error_traceback = traceback.format_exc()
+        print(error_traceback)
+        
+        update_batch_task_status(task_id, 
+                               status="❌ 失败", 
+                               error=f"错误类型: {type(e).__name__}\n错误信息: {str(e)}\n\n详细堆栈:\n{error_traceback}")
+
+def submit_batch_task(files, prompt_path, infer_mode, max_text_tokens_per_sentence, 
+                     sentences_bucket_max_size, audio_format, audio_bitrate, 
+                     clean_options, chapter_detection_mode, kwargs):
+    """提交批量任务"""
+    task_id = f"batch_{str(uuid.uuid4())[:8]}"
+    
+    # 初始化任务状态
+    update_batch_task_status(task_id, status="⏳ 排队中", progress="批量任务已提交，等待处理...")
+    
+    # 提交任务到线程池
+    future = batch_task_executor.submit(
+        batch_audio_generation,
+        task_id, files, prompt_path, infer_mode,
+        max_text_tokens_per_sentence, sentences_bucket_max_size,
+        audio_format, audio_bitrate, clean_options, chapter_detection_mode, kwargs
+    )
+    
+    print(f"已提交批量任务: {task_id}")
+    return task_id
+
+def get_all_batch_tasks():
+    """获取所有批量任务状态"""
+    with batch_task_lock:
+        return dict(batch_task_status)
+
+def clear_completed_batch_tasks():
+    """清理已完成的批量任务"""
+    with batch_task_lock:
+        completed_tasks = []
+        for task_id, status in batch_task_status.items():
+            if status["status"] in ["✅ 完成", "❌ 失败"]:
+                completed_tasks.append(task_id)
+        
+        for task_id in completed_tasks:
+            del batch_task_status[task_id]
         
         return len(completed_tasks)
 
@@ -1119,7 +1590,7 @@ def update_prompt_audio():
     return update_button
 
 def process_uploaded_file(file):
-    """Process uploaded text/epub file"""
+    """Process uploaded text/epub file with enhanced chapter detection"""
     if file is None:
         return "", "", "", "", gr.update(visible=False, value="")
     
@@ -1130,8 +1601,20 @@ def process_uploaded_file(file):
     chapters = []  # Initialize chapters list
     
     if file_ext == '.txt':
-        content = read_txt_file(file_path)
-        chapters_display_update = gr.update(visible=False, value="")
+        # 使用智能编码检测读取TXT文件
+        encoding = detect_file_encoding(file_path)
+        try:
+            with open(file_path, 'r', encoding=encoding, errors='replace') as f:
+                content = f.read()
+        except:
+            content = read_txt_file(file_path)  # 回退到原始方法
+        
+        # 对TXT文件也进行智能章节检测
+        if content and content.strip():
+            chapters = smart_chinese_chapter_detection(content)
+            print(f"TXT智能章节检测完成，发现 {len(chapters)} 个章节")
+        
+        chapters_display_update = format_chapters_display(chapters) if chapters else gr.update(visible=False, value="")
     elif file_ext == '.epub':
         content, chapters = read_epub_file(file_path)
         chapters_display_update = format_chapters_display(chapters)
@@ -1143,11 +1626,11 @@ def process_uploaded_file(file):
     if len(content) > max_preview_chars:
         preview_content = content[:max_preview_chars] + f"\n\n... (文件过长，仅显示前{max_preview_chars}字符作为预览。完整内容将用于音频生成。)"
         if chapters:
-            preview_content += f"\n\n检测到 {len(chapters)} 个章节，生成M4B格式时将添加章节书签。"
+            preview_content += f"\n\n🧠 智能检测到 {len(chapters)} 个章节，支持章节分段和M4B书签。"
         return preview_content, filename, content, chapters, chapters_display_update  # Return preview, filename, full content, chapters, and display update
     
     if chapters:
-        content += f"\n\n检测到 {len(chapters)} 个章节，生成M4B格式时将添加章节书签。"
+        content += f"\n\n🧠 智能检测到 {len(chapters)} 个章节，支持章节分段和M4B书签。"
     
     return content, filename, content, chapters, chapters_display_update  # Return same content for both preview and full, plus chapters and display update
 
@@ -1452,6 +1935,144 @@ with gr.Blocks(
         
         # 已删除示例案例显示组件
     
+    # 批量转换页面
+    with gr.Tab("批量转换"):
+        gr.Markdown("## 📚 批量文本转音频")
+        gr.Markdown("上传多个文本文件，批量转换为音频。支持智能章节识别、文本清理和多种音频格式。")
+        
+        with gr.Row():
+            # 左侧控制面板
+            with gr.Column(scale=2):
+                with gr.Group(elem_classes="control-panel"):
+                    gr.Markdown("### 📁 文件上传")
+                    batch_files = gr.File(
+                        label="上传文本文件 (支持 .txt)",
+                        file_count="multiple",
+                        file_types=[".txt"],
+                        key="batch_files"
+                    )
+                    
+                    gr.Markdown("### 🎵 参考音频")
+                    with gr.Row():
+                        batch_sample_dropdown = gr.Dropdown(
+                            label="选择样本音频",
+                            choices=get_sample_files() if get_sample_files() else ["无可用文件"],
+                            value=get_sample_files()[0] if get_sample_files() else "无可用文件",
+                            interactive=True
+                        )
+                        batch_refresh_btn = gr.Button("🔄", size="sm", variant="secondary")
+                    
+                    batch_prompt_audio = gr.Audio(
+                        label="参考音频预览",
+                        interactive=False,
+                        value=os.path.join("samples", get_sample_files()[0]) if get_sample_files() else None
+                    )
+                
+                with gr.Group(elem_classes="control-panel"):
+                    gr.Markdown("### 🧹 文本处理")
+                    batch_clean_options = gr.CheckboxGroup(
+                        ["合并空行", "移除多余空格"],
+                        label="清理选项",
+                        value=["合并空行", "移除多余空格"]
+                    )
+                    
+                    batch_chapter_mode = gr.Radio(
+                        ["智能中文解析", "无章节检测"],
+                        label="章节检测模式",
+                        value="智能中文解析",
+                        info="智能中文解析：自动识别各种中文章节格式"
+                    )
+                
+                with gr.Group(elem_classes="control-panel"):
+                    gr.Markdown("### ⚙️ 生成设置")
+                    with gr.Row():
+                        batch_infer_mode = gr.Radio(
+                            choices=["普通推理", "批次推理"], 
+                            label="推理模式",
+                            value="批次推理"
+                        )
+                        batch_audio_format = gr.Radio(
+                            choices=["WAV", "MP3", "M4B"], 
+                            label="音频格式",
+                            value="MP3"
+                        )
+                    
+                    with gr.Row():
+                        batch_audio_bitrate = gr.Slider(
+                            label="音频码率 (kbps)",
+                            minimum=32,
+                            maximum=320,
+                            value=64,
+                            step=32
+                        )
+                        batch_max_tokens = gr.Slider(
+                            label="分句最大Token数",
+                            minimum=20,
+                            maximum=200,
+                            value=120,
+                            step=2
+                        )
+                    
+                    batch_bucket_size = gr.Slider(
+                        label="分句分桶容量（批次推理）",
+                        minimum=1,
+                        maximum=16,
+                        value=8,
+                        step=1
+                    )
+                
+                # 开始批量转换按钮
+                start_batch_btn = gr.Button(
+                    "🚀 开始批量转换", 
+                    variant="primary", 
+                    size="lg",
+                    elem_classes="generation-button"
+                )
+            
+            # 右侧状态显示
+            with gr.Column(scale=3):
+                with gr.Group(elem_classes="control-panel"):
+                    gr.Markdown("### 📈 批量任务状态")
+                    batch_status_info = gr.Textbox(
+                        label="当前状态",
+                        value="🟡 等待开始批量转换...",
+                        interactive=False,
+                        max_lines=3
+                    )
+                    
+                    batch_progress_info = gr.Textbox(
+                        label="详细进度",
+                        placeholder="批量进度信息将在处理过程中显示...",
+                        interactive=False,
+                        max_lines=6
+                    )
+                    
+                    batch_current_file = gr.Textbox(
+                        label="当前处理文件",
+                        interactive=False
+                    )
+                
+                with gr.Group(elem_classes="control-panel"):
+                    gr.Markdown("### 📊 批量结果")
+                    batch_results_display = gr.Dataframe(
+                        headers=["文件名", "输出路径", "状态"],
+                        label="处理结果",
+                        interactive=False,
+                        wrap=True
+                    )
+                
+                with gr.Group(elem_classes="control-panel"):
+                    gr.Markdown("### 🔧 批量任务管理")
+                    with gr.Row():
+                        refresh_batch_btn = gr.Button("刷新状态", variant="primary", size="sm")
+                        clear_batch_btn = gr.Button("清理已完成", variant="secondary", size="sm")
+                    
+                    batch_task_id_display = gr.Textbox(
+                        label="最新任务ID",
+                        interactive=False,
+                        visible=False
+                    )
+    
     # 任务管理页面
     with gr.Tab("任务管理"):
         gr.Markdown("## 后台任务管理")
@@ -1566,6 +2187,102 @@ with gr.Blocks(
         # 注意：这会增加服务器负载，建议手动刷新
         # demo.load(refresh_tasks, outputs=[tasks_display], every=5)
 
+    # --- 批量处理相关函数 ---
+    
+    def start_batch_conversion(files, selected_sample, infer_mode, max_tokens, bucket_size, 
+                              audio_format, audio_bitrate, clean_options, chapter_mode):
+        """开始批量转换"""
+        try:
+            # 验证输入
+            if not files or len(files) == 0:
+                return "❌ 请先上传文本文件", "", "", [], "未提交任务"
+            
+            if not selected_sample or selected_sample == "无可用文件":
+                return "❌ 请选择参考音频文件", "", "", [], "未提交任务"
+            
+            # 获取参考音频路径
+            prompt_path = os.path.join("samples", selected_sample)
+            if not os.path.exists(prompt_path):
+                return "❌ 参考音频文件不存在", "", "", [], "未提交任务"
+            
+            # 准备高级参数（使用默认值）
+            kwargs = {
+                "do_sample": True,
+                "top_p": 0.8,
+                "top_k": 30,
+                "temperature": 1.0,
+                "length_penalty": 0.0,
+                "num_beams": 3,
+                "repetition_penalty": 10.0,
+                "max_mel_tokens": 600,
+            }
+            
+            # 提交批量任务
+            task_id = submit_batch_task(
+                files, prompt_path, infer_mode, max_tokens,
+                bucket_size, audio_format, audio_bitrate,
+                clean_options, chapter_mode, kwargs
+            )
+            
+            # 返回初始状态
+            status_info = f"🚀 批量任务已提交\n📋 任务ID: {task_id}\n📁 文件数量: {len(files)} 个"
+            progress_info = "正在准备批量处理，请等待..."
+            
+            return status_info, progress_info, "", [], task_id
+            
+        except Exception as e:
+            error_msg = f"❌ 提交批量任务时发生错误: {str(e)}"
+            print(f"ERROR: {error_msg}")
+            return error_msg, "", "", [], "提交失败"
+    
+    def refresh_batch_status(task_id):
+        """刷新批量任务状态"""
+        if not task_id or task_id in ["未提交任务", "提交失败"]:
+            return "🟡 暂无活动任务", "", "", []
+        
+        task_info = get_batch_task_status(task_id)
+        status = task_info.get("status", "未知")
+        progress = task_info.get("progress", "")
+        current_file = task_info.get("current_file", "")
+        results = task_info.get("results", [])
+        
+        # 格式化结果显示
+        results_data = []
+        for result in results:
+            file_name = result.get("file_name", "")
+            result_path = os.path.basename(result.get("result_path", "")) if result.get("result_path") else ""
+            status_text = result.get("status", "")
+            results_data.append([file_name, result_path, status_text])
+        
+        return status, progress, current_file, results_data
+    
+    def clear_batch_tasks():
+        """清理已完成的批量任务"""
+        cleared_count = clear_completed_batch_tasks()
+        return f"已清理 {cleared_count} 个已完成任务", "", "", []
+    
+    def on_batch_sample_change(selected_file):
+        """批量页面样本音频选择变化"""
+        if selected_file and selected_file != "无可用文件":
+            file_path = os.path.join("samples", selected_file)
+            if os.path.exists(file_path):
+                return gr.update(value=file_path)
+        return gr.update(value=None)
+    
+    def refresh_batch_sample_files():
+        """刷新批量页面的样本文件列表"""
+        files = get_sample_files()
+        if not files:
+            return (
+                gr.update(choices=["无可用文件"], value="无可用文件"),
+                gr.update(value=None)
+            )
+        
+        return (
+            gr.update(choices=files, value=files[0]),
+            gr.update(value=os.path.join("samples", files[0]))
+        )
+
     def on_input_text_change(text, max_tokens_per_sentence):
         if text and len(text) > 0:
             text_tokens_list = tts.tokenizer.tokenize(text)
@@ -1639,6 +2356,48 @@ with gr.Blocks(
     clear_cache_btn.click(
         handle_cache_clear,
         outputs=[cache_info]
+    )
+    
+    # --- 批量处理事件绑定 ---
+    
+    # 批量样本音频选择事件
+    batch_sample_dropdown.change(
+        on_batch_sample_change,
+        inputs=[batch_sample_dropdown],
+        outputs=[batch_prompt_audio]
+    )
+    
+    # 批量样本音频刷新事件
+    batch_refresh_btn.click(
+        refresh_batch_sample_files,
+        outputs=[batch_sample_dropdown, batch_prompt_audio]
+    )
+    
+    # 开始批量转换事件
+    start_batch_btn.click(
+        start_batch_conversion,
+        inputs=[
+            batch_files, batch_sample_dropdown, batch_infer_mode,
+            batch_max_tokens, batch_bucket_size, batch_audio_format,
+            batch_audio_bitrate, batch_clean_options, batch_chapter_mode
+        ],
+        outputs=[
+            batch_status_info, batch_progress_info, batch_current_file,
+            batch_results_display, batch_task_id_display
+        ]
+    )
+    
+    # 刷新批量状态事件
+    refresh_batch_btn.click(
+        refresh_batch_status,
+        inputs=[batch_task_id_display],
+        outputs=[batch_status_info, batch_progress_info, batch_current_file, batch_results_display]
+    )
+    
+    # 清理批量任务事件
+    clear_batch_btn.click(
+        clear_batch_tasks,
+        outputs=[batch_status_info, batch_progress_info, batch_current_file, batch_results_display]
     )
 
 
