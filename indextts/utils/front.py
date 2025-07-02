@@ -370,31 +370,10 @@ class TextTokenizer:
                     current_sentence = []
                     current_sentence_tokens_len = 0
                 continue
-            # 如果当前tokens的长度超过最大限制
-            if not  ("," in split_tokens or "▁," in split_tokens ) and ("," in current_sentence or "▁," in current_sentence): 
-                # 如果当前tokens中有,，则按,分割
-                sub_sentences = TextTokenizer.split_sentences_by_token(
-                    current_sentence, [",", "▁,"], max_tokens_per_sentence=max_tokens_per_sentence
-                )
-            elif "-" not in split_tokens and "-" in current_sentence:
-                # 没有,，则按-分割
-                sub_sentences = TextTokenizer.split_sentences_by_token(
-                    current_sentence, ["-"], max_tokens_per_sentence=max_tokens_per_sentence
-                )
-            else:
-                # 按照长度分割
-                sub_sentences = []
-                for j in range(0, len(current_sentence), max_tokens_per_sentence):
-                    if j + max_tokens_per_sentence < len(current_sentence):
-                        sub_sentences.append(current_sentence[j : j + max_tokens_per_sentence])
-                    else:
-                        sub_sentences.append(current_sentence[j:])
-                warnings.warn(
-                    f"The tokens length of sentence exceeds limit: {max_tokens_per_sentence}, "
-                    f"Tokens in sentence: {current_sentence}."
-                    "Maybe unexpected behavior",
-                    RuntimeWarning,
-                )
+            # 如果当前tokens的长度超过最大限制，使用智能分割
+            sub_sentences = TextTokenizer._intelligent_split_long_sentence(
+                current_sentence, max_tokens_per_sentence, split_tokens
+            )
             sentences.extend(sub_sentences)
             current_sentence = []
             current_sentence_tokens_len = 0
@@ -413,6 +392,172 @@ class TextTokenizer:
             else:
                 merged_sentences.append(sentence)
         return merged_sentences
+
+    @staticmethod
+    def _intelligent_split_long_sentence(sentence: List[str], max_tokens: int, excluded_split_tokens: List[str]) -> List[List[str]]:
+        """
+        智能分割超长句子，优先在语义自然的位置分割
+        """
+        if len(sentence) <= max_tokens:
+            return [sentence]
+        
+        # 定义智能分割优先级（从高到低）
+        split_candidates = [
+            # 1. 逗号和顿号（最常见的自然停顿）
+            {"tokens": [",", "▁,", "、", "▁、"], "priority": 1, "desc": "逗号/顿号"},
+            # 2. 分号和冒号（较强的语义分割）
+            {"tokens": ["；", "▁；", ";", "▁;", "：", "▁：", ":", "▁:"], "priority": 2, "desc": "分号/冒号"},
+            # 3. 连词和转折词（语义连接点）
+            {"tokens": ["但是", "▁但是", "然而", "▁然而", "而且", "▁而且", "并且", "▁并且", "或者", "▁或者", "以及", "▁以及", "同时", "▁同时"], "priority": 3, "desc": "连词"},
+            # 4. 介词短语（时间、地点等）
+            {"tokens": ["在", "▁在", "于", "▁于", "从", "▁从", "向", "▁向", "到", "▁到", "为了", "▁为了", "由于", "▁由于"], "priority": 4, "desc": "介词"},
+            # 5. 关系词（定语从句等）
+            {"tokens": ["的", "▁的", "地", "▁地", "得", "▁得", "所", "▁所"], "priority": 5, "desc": "关系词"},
+            # 6. 连字符和破折号
+            {"tokens": ["-", "▁-", "—", "▁—", "～", "▁～"], "priority": 6, "desc": "连字符"},
+        ]
+        
+        # 过滤掉已经被排除的分割符
+        available_candidates = []
+        for candidate in split_candidates:
+            filtered_tokens = [token for token in candidate["tokens"] if token not in excluded_split_tokens]
+            if filtered_tokens:
+                available_candidates.append({
+                    "tokens": filtered_tokens,
+                    "priority": candidate["priority"],
+                    "desc": candidate["desc"]
+                })
+        
+        # 尝试按优先级进行智能分割
+        for candidate in available_candidates:
+            split_positions = TextTokenizer._find_best_split_positions(
+                sentence, candidate["tokens"], max_tokens
+            )
+            if split_positions:
+                sub_sentences = TextTokenizer._split_at_positions(sentence, split_positions)
+                # 检查分割结果是否合理
+                if all(len(sub_sentence) <= max_tokens for sub_sentence in sub_sentences):
+                    return sub_sentences
+        
+        # 如果智能分割都不行，使用均匀分割作为最后方案
+        return TextTokenizer._balanced_split(sentence, max_tokens)
+    
+    @staticmethod
+    def _find_best_split_positions(sentence: List[str], split_tokens: List[str], max_tokens: int) -> List[int]:
+        """
+        找到最佳的分割位置，优化分割后的段落长度平衡
+        """
+        # 找到所有可能的分割点
+        split_points = []
+        for i, token in enumerate(sentence):
+            if token in split_tokens and i > 0 and i < len(sentence) - 1:  # 不在开头或结尾
+                split_points.append(i + 1)  # 在分割符后面分割
+        
+        if not split_points:
+            return []
+        
+        # 动态规划找到最优分割组合
+        return TextTokenizer._optimize_split_positions(sentence, split_points, max_tokens)
+    
+    @staticmethod
+    def _optimize_split_positions(sentence: List[str], split_points: List[int], max_tokens: int) -> List[int]:
+        """
+        使用动态规划优化分割位置，尽量保持各段落长度均匀
+        """
+        sentence_len = len(sentence)
+        split_points = [0] + split_points + [sentence_len]  # 添加开头和结尾
+        split_points = sorted(list(set(split_points)))  # 去重并排序
+        
+        best_positions = []
+        current_start = 0
+        
+        for i in range(1, len(split_points)):
+            segment_len = split_points[i] - current_start
+            if segment_len > max_tokens:
+                # 需要在这个区间内找到分割点
+                valid_points = [p for p in split_points[1:i] if p > current_start]
+                if valid_points:
+                    # 选择最接近理想长度的分割点
+                    ideal_len = max_tokens * 0.75  # 目标长度为最大长度的75%
+                    best_point = min(valid_points, key=lambda p: abs(p - current_start - ideal_len))
+                    best_positions.append(best_point)
+                    current_start = best_point
+                else:
+                    # 没有合适的分割点，返回空列表表示此方案不可行
+                    return []
+            elif i == len(split_points) - 1:  # 最后一段
+                break
+            else:
+                # 检查是否可以延伸到下一个分割点
+                next_segment_len = split_points[i + 1] - current_start if i + 1 < len(split_points) else segment_len
+                if next_segment_len <= max_tokens:
+                    continue  # 可以延伸，不在这里分割
+                else:
+                    # 必须在这里分割
+                    best_positions.append(split_points[i])
+                    current_start = split_points[i]
+        
+        return best_positions
+    
+    @staticmethod
+    def _split_at_positions(sentence: List[str], positions: List[int]) -> List[List[str]]:
+        """
+        在指定位置分割句子
+        """
+        if not positions:
+            return [sentence]
+        
+        positions = [0] + sorted(positions) + [len(sentence)]
+        sub_sentences = []
+        
+        for i in range(len(positions) - 1):
+            start, end = positions[i], positions[i + 1]
+            if end > start:
+                sub_sentences.append(sentence[start:end])
+        
+        return [sub for sub in sub_sentences if sub]  # 过滤空句子
+    
+    @staticmethod
+    def _balanced_split(sentence: List[str], max_tokens: int) -> List[List[str]]:
+        """
+        均匀分割长句子，作为最后的备选方案
+        """
+        if len(sentence) <= max_tokens:
+            return [sentence]
+        
+        # 计算需要分割成多少段
+        num_segments = (len(sentence) + max_tokens - 1) // max_tokens
+        ideal_segment_size = len(sentence) // num_segments
+        
+        sub_sentences = []
+        start = 0
+        
+        for i in range(num_segments):
+            if i == num_segments - 1:  # 最后一段
+                end = len(sentence)
+            else:
+                end = min(start + ideal_segment_size, start + max_tokens)
+                # 尝试在附近找到更自然的分割点（空格或标点）
+                for j in range(max(start + ideal_segment_size - 5, start + 1), 
+                              min(start + ideal_segment_size + 5, start + max_tokens)):
+                    if j < len(sentence) and (sentence[j].startswith("▁") or sentence[j] in [",", "，", ".", "。"]):
+                        end = j + 1
+                        break
+            
+            if end > start:
+                sub_sentences.append(sentence[start:end])
+                start = end
+        
+        # 确保没有超长段落
+        final_sentences = []
+        for sub_sentence in sub_sentences:
+            if len(sub_sentence) <= max_tokens:
+                final_sentences.append(sub_sentence)
+            else:
+                # 递归处理仍然超长的段落
+                final_sentences.extend(TextTokenizer._balanced_split(sub_sentence, max_tokens))
+        
+        return final_sentences
 
     punctuation_marks_tokens = [
         ".",

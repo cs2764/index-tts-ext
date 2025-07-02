@@ -992,7 +992,7 @@ def clear_completed_batch_tasks():
 # 已删除示例案例加载代码
 example_cases = []
 
-def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sentences_bucket_max_size=6,
+def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sentences_bucket_max_size=4,
                 auto_save=True, audio_format="MP3", audio_bitrate=64, enable_chapter_split=False, chapters_per_file=1,
                 uploaded_file_name="", selected_sample="", full_text="", chapters=None, 
                 background_mode=True, *args, progress=gr.Progress()):
@@ -1078,10 +1078,25 @@ def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sente
         
         print(f"待处理文本长度: {len(text_to_process)}")
         
+        # 准备生成参数
+        do_sample, top_p, top_k, temperature, \
+            length_penalty, num_beams, repetition_penalty, max_mel_tokens = args
+        kwargs = {
+            "do_sample": bool(do_sample),
+            "top_p": float(top_p),
+            "top_k": int(top_k) if int(top_k) > 0 else None,
+            "temperature": float(temperature),
+            "length_penalty": float(length_penalty),
+            "num_beams": int(num_beams),
+            "repetition_penalty": float(repetition_penalty),
+            "max_mel_tokens": int(max_mel_tokens)
+        }
+        
         # 处理章节分段
         processed_chapters = []
         output_folder = None  # 用于分段文件的文件夹
         
+        print(f"调试信息: chapters={len(chapters) if chapters else 0}, enable_chapter_split={enable_chapter_split}")
         if chapters and len(chapters) > 0 and enable_chapter_split:
             print(f"启用章节分段，将按每{chapters_per_file}章分割")
             
@@ -1172,19 +1187,7 @@ def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sente
             # Ensure outputs directory exists
             os.makedirs("outputs", exist_ok=True)
             
-            # 准备生成参数
-            do_sample, top_p, top_k, temperature, \
-                length_penalty, num_beams, repetition_penalty, max_mel_tokens = args
-            kwargs = {
-                "do_sample": bool(do_sample),
-                "top_p": float(top_p),
-                "top_k": int(top_k) if int(top_k) > 0 else None,
-                "temperature": float(temperature),
-                "length_penalty": float(length_penalty),
-                "num_beams": num_beams,
-                "repetition_penalty": float(repetition_penalty),
-                "max_mel_tokens": int(max_mel_tokens),
-            }
+            # 使用已定义的kwargs参数
             
             # 提交后台任务
             task_id = submit_background_task(
@@ -1215,7 +1218,8 @@ def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sente
         status_updates = update_status("📋 准备生成参数...", detailed_info, prep_system_info, show_progress=True, show_system=True)
         
         # 设置输出路径 - 根据是否分段处理
-        if enable_chapter_split and len(processed_chapters) > 1:
+        print(f"分段条件检查: enable_chapter_split={enable_chapter_split}, output_folder={output_folder is not None}, processed_chapters={len(processed_chapters)}")
+        if enable_chapter_split and output_folder and len(processed_chapters) >= 1:
             # 分段模式：处理多个文件
             print(f"分段模式：将生成{len(processed_chapters)}个文件到文件夹：{output_folder}")
             
@@ -1252,46 +1256,66 @@ def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sente
                 
                 # 生成音频
                 start_time = time.time()
-                if infer_mode == "普通推理":
-                    wav_output = tts.infer(prompt_path, chapter_group['content'], temp_segment_path, verbose=cmd_args.verbose,
-                                       max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
-                                       **kwargs)
-                else:
-                    # 批次推理
-                    wav_output = tts.infer_fast(prompt_path, chapter_group['content'], temp_segment_path, verbose=cmd_args.verbose,
-                        max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
-                        sentences_bucket_max_size=(sentences_bucket_max_size),
-                        **kwargs)
-                
-                generation_time = time.time() - start_time
-                print(f"分段 {idx+1} 生成完成，耗时: {generation_time:.2f} 秒")
-                
-                # 转换格式（如果需要）
-                final_segment_path = wav_output
-                if auto_save and audio_format != "WAV":
-                    print(f"转换分段 {idx+1} 格式到 {audio_format}...")
-                    if audio_format == "MP3":
-                        if convert_audio_format(wav_output, segment_path, "mp3", f"{audio_bitrate}k"):
-                            final_segment_path = segment_path
-                            if os.path.exists(temp_segment_path) and temp_segment_path != segment_path:
-                                os.remove(temp_segment_path)
-                    elif audio_format == "M4B":
-                        if convert_audio_format(wav_output, segment_path, "m4b", f"{audio_bitrate}k", [chapters[i] for i in range(chapter_group['start_chapter']-1, chapter_group['end_chapter'])]):
-                            final_segment_path = segment_path
-                            if os.path.exists(temp_segment_path) and temp_segment_path != segment_path:
-                                os.remove(temp_segment_path)
-                
-                generated_files.append(final_segment_path)
-                print(f"分段 {idx+1} 完成: {final_segment_path}")
+                try:
+                    if infer_mode == "普通推理":
+                        wav_output = tts.infer(prompt_path, chapter_group['content'], temp_segment_path, verbose=cmd_args.verbose,
+                                           max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
+                                           **kwargs)
+                    else:
+                        # 批次推理
+                        wav_output = tts.infer_fast(prompt_path, chapter_group['content'], temp_segment_path, verbose=cmd_args.verbose,
+                            max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
+                            sentences_bucket_max_size=(sentences_bucket_max_size),
+                            **kwargs)
+                    
+                    generation_time = time.time() - start_time
+                    
+                    # 检查生成是否成功
+                    if wav_output is None or not os.path.exists(temp_segment_path):
+                        print(f"❌ 分段 {idx+1} 生成失败: 音频文件未生成")
+                        continue
+                    
+                    print(f"分段 {idx+1} 生成完成，耗时: {generation_time:.2f} 秒")
+                    
+                    # 转换格式（如果需要）
+                    final_segment_path = wav_output
+                    if auto_save and audio_format != "WAV":
+                        print(f"转换分段 {idx+1} 格式到 {audio_format}...")
+                        if audio_format == "MP3":
+                            if convert_audio_format(wav_output, segment_path, "mp3", f"{audio_bitrate}k"):
+                                final_segment_path = segment_path
+                                if os.path.exists(temp_segment_path) and temp_segment_path != segment_path:
+                                    os.remove(temp_segment_path)
+                        elif audio_format == "M4B":
+                            if convert_audio_format(wav_output, segment_path, "m4b", f"{audio_bitrate}k", [chapters[i] for i in range(chapter_group['start_chapter']-1, chapter_group['end_chapter'])]):
+                                final_segment_path = segment_path
+                                if os.path.exists(temp_segment_path) and temp_segment_path != segment_path:
+                                    os.remove(temp_segment_path)
+                    
+                    generated_files.append(final_segment_path)
+                    print(f"分段 {idx+1} 完成: {final_segment_path}")
+                    
+                except Exception as e:
+                    print(f"❌ 分段 {idx+1} 生成出错: {str(e)}")
+                    continue
             
             # 分段生成完成
             print(f"所有分段生成完成，共{len(generated_files)}个文件")
-            success_info = f"✅ 分段生成完成！\n📁 文件夹: {os.path.basename(output_folder)}\n📄 文件数: {len(generated_files)}\n📏 总大小: {sum(os.path.getsize(f) for f in generated_files) / 1024 / 1024:.2f} MB"
-            final_system_info = get_system_status()
-            status_updates = update_status("✅ 分段生成完成", success_info, final_system_info, show_progress=True, show_system=True)
             
-            # 返回第一个文件作为预览（或者可以返回文件夹信息）
-            return gr.update(value=generated_files[0], visible=True), *status_updates
+            if len(generated_files) > 0:
+                success_info = f"✅ 分段生成完成！\n📁 文件夹: {os.path.basename(output_folder)}\n📄 文件数: {len(generated_files)}\n📏 总大小: {sum(os.path.getsize(f) for f in generated_files) / 1024 / 1024:.2f} MB"
+                final_system_info = get_system_status()
+                status_updates = update_status("✅ 分段生成完成", success_info, final_system_info, show_progress=True, show_system=True)
+                
+                # 返回第一个文件作为预览
+                return gr.update(value=generated_files[0], visible=True), *status_updates
+            else:
+                # 没有生成任何文件
+                error_info = f"❌ 分段生成失败！\n📁 文件夹: {os.path.basename(output_folder)}\n📄 文件数: 0\n原因: 所有分段都生成失败，请检查错误信息"
+                final_system_info = get_system_status()
+                status_updates = update_status("❌ 分段生成失败", error_info, final_system_info, show_progress=True, show_system=True)
+                
+                return gr.update(value=None, visible=True), *status_updates
         
         else:
             # 单文件模式：正常处理流程
@@ -1918,7 +1942,7 @@ with gr.Blocks(
                             info="建议80~200之间，值越大，分句越长；值越小，分句越碎；过小过大都可能导致音频质量不高",
                         )
                         sentences_bucket_max_size = gr.Slider(
-                            label="分句分桶的最大容量（批次推理生效）", value=8, minimum=1, maximum=16, step=1, key="sentences_bucket_max_size",
+                            label="分句分桶的最大容量（批次推理生效）", value=4, minimum=1, maximum=16, step=1, key="sentences_bucket_max_size",
                             info="建议4-10之间，值越大，一批次推理包含的分句数越多，过大可能导致内存溢出",
                         )
                     with gr.Accordion("预览分句结果", open=True) as sentences_settings:
