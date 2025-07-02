@@ -61,3 +61,8 @@ txttoepub.py
 samples/0女声-很烧的姐姐 Voice Generator.mp3
 samples/0流萤.wav
 samples/0高树三姐妹4 (2).mp3
+.claude/settings.local.json
+test_segmentation.txt
+test_intelligent_splitting.py
+test_splitting_simple.py
+samples/ӫ Voice Generator.mp3
